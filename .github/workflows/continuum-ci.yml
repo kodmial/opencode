@@ -1,4 +1,4 @@
-name: Continuum CI
+name: OpenCode Coding Artifact
 
 on:
   pull_request:
@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: continuum-ci-${{ github.event.pull_request.number || github.ref }}
+  group: opencode-coding-artifact-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -48,3 +48,33 @@ jobs:
             exit 1
           fi
           ls -lh "$BIN"
+
+      - name: Package coding artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=packages/opencode/dist/opencode-linux-x64/bin/opencode
+          OUT="$RUNNER_TEMP/opencode-coding-artifact"
+          mkdir -p "$OUT"
+          install -m 0755 "$BIN" "$OUT/opencode-coding-linux-x64"
+          (
+            cd "$OUT"
+            sha256sum opencode-coding-linux-x64 > opencode-coding-linux-x64.sha256
+          )
+          {
+            echo "source_repository=$GITHUB_REPOSITORY"
+            echo "source_sha=$GITHUB_SHA"
+            echo "source_ref=$GITHUB_REF"
+            echo "build_target=linux-x64-glibc"
+            echo "build_command=bun run --cwd packages/opencode build:coding"
+          } > "$OUT/build-metadata.txt"
+          ls -lh "$OUT"
+
+      - name: Upload coding artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: opencode-coding-linux-x64
+          path: ${{ runner.temp }}/opencode-coding-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
