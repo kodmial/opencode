@@ -1,0 +1,40 @@
+name: Bootstrap OpenCode upstream
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/bootstrap-opencode.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mirror anomalyco/opencode into kodmial/opencode
+        env:
+          TAP_PAD: ${{ secrets.TAP_PAD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_PAD:-}" ]; then
+            echo "TAP_PAD secret is missing or empty" >&2
+            exit 1
+          fi
+
+          git clone --mirror https://github.com/anomalyco/opencode.git upstream.git
+          cd upstream.git
+
+          git remote add target "https://x-access-token:${TAP_PAD}@github.com/kodmial/opencode.git"
+
+          # Preserve upstream branches and tags.
+          git push target 'refs/heads/*:refs/heads/*' --force
+          git push target 'refs/tags/*:refs/tags/*' --force
+
+          # Our repository was created with default branch main; make it track
+          # the current upstream default branch (dev) as the working baseline.
+          git push target refs/heads/dev:refs/heads/main --force
