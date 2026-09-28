@@ -1,12 +1,9 @@
 name: Continuum scheduler
 
+# Manual-only until Continuum's OpenCode executor is switched from the
+# upstream installer to this repository's local optimized build.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - ".continuum.yml"
-      - ".github/workflows/continuum-scheduler.yml"
 
 permissions:
   actions: write
