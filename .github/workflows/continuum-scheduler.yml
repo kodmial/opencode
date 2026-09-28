@@ -1,15 +1,21 @@
 name: Continuum scheduler
 
-# Manual-only until Continuum's OpenCode executor is switched from the
-# upstream installer to this repository's local optimized build.
 on:
   workflow_dispatch:
+  issues:
+    types: [opened, reopened]
+  schedule:
+    - cron: "*/5 * * * *"
 
 permissions:
   actions: write
   contents: read
   issues: write
   pull-requests: read
+
+concurrency:
+  group: continuum-scheduler
+  cancel-in-progress: false
 
 jobs:
   schedule:
