@@ -1,0 +1,29 @@
+name: Continuum auto-merge
+
+on:
+  workflow_run:
+    workflows: ["Continuum CI"]
+    types: [completed]
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+
+permissions:
+  actions: write
+  contents: write
+  issues: write
+  pull-requests: write
+  statuses: read
+
+concurrency:
+  group: continuum-auto-merge
+  cancel-in-progress: false
+
+jobs:
+  reconcile:
+    uses: kodmial/continuum/.github/workflows/consumer-auto-merge.yml@main
+    with:
+      review: false
+      release: false
+      ci_workflow: continuum-ci.yml
+      scheduler_workflow: continuum-scheduler.yml
