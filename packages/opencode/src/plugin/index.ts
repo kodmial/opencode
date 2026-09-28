@@ -9,19 +9,8 @@ import type {
 import { Config } from "@/config/config"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ServerAuth } from "@/server/auth"
-import { CodexAuthPlugin } from "./openai/codex"
 import { Session } from "@/session/session"
 import { NamedError } from "@opencode-ai/core/util/error"
-import { CopilotAuthPlugin } from "./github-copilot/copilot"
-import { ModalPlugin } from "./modal/modal"
-import { gitlabAuthPlugin as GitlabAuthPlugin } from "opencode-gitlab-auth"
-import { PoeAuthPlugin } from "opencode-poe-auth"
-import { CloudflareAIGatewayAuthPlugin, CloudflareWorkersAuthPlugin } from "./cloudflare"
-import { AzureAuthPlugin } from "./azure"
-import { DigitalOceanAuthPlugin } from "./digitalocean"
-import { XaiAuthPlugin } from "./xai"
-import { CerebrasPlugin } from "./cerebras"
-import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { Effect, Layer, Context } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
@@ -63,25 +52,52 @@ export function experimentalWebSocketsEnabled(input: { enabled: boolean; channel
   return input.enabled || ["local", "dev", "beta"].includes(input.channel ?? InstallationChannel)
 }
 
-// Built-in plugins that are directly imported (not installed from npm)
-function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
+// Load the broad built-in auth/plugin set only when it is actually enabled.
+// The coding-only runtime disables this set, so these modules never initialize
+// or retain provider-specific SDK state in the one-shot agent process.
+async function internalPlugins(flags: RuntimeFlags.Info): Promise<PluginInstance[]> {
+  const [
+    codex,
+    copilot,
+    modal,
+    gitlab,
+    poe,
+    cloudflare,
+    azure,
+    digitalocean,
+    snowflake,
+    xai,
+    cerebras,
+  ] = await Promise.all([
+    import("./openai/codex"),
+    import("./github-copilot/copilot"),
+    import("./modal/modal"),
+    import("opencode-gitlab-auth"),
+    import("opencode-poe-auth"),
+    import("./cloudflare"),
+    import("./azure"),
+    import("./digitalocean"),
+    import("./snowflake-cortex"),
+    import("./xai"),
+    import("./cerebras"),
+  ])
+
   return [
-    // Temporary rollout: pre-release builds use WebSockets by default; releases require explicit opt-in.
     (input) =>
-      CodexAuthPlugin(input, {
+      codex.CodexAuthPlugin(input, {
         experimentalWebSockets: experimentalWebSocketsEnabled({ enabled: flags.experimentalWebSockets }),
       }),
-    CopilotAuthPlugin,
-    ModalPlugin,
-    GitlabAuthPlugin,
-    PoeAuthPlugin,
-    CloudflareWorkersAuthPlugin,
-    CloudflareAIGatewayAuthPlugin,
-    AzureAuthPlugin,
-    DigitalOceanAuthPlugin,
-    SnowflakeCortexAuthPlugin,
-    XaiAuthPlugin,
-    CerebrasPlugin,
+    copilot.CopilotAuthPlugin,
+    modal.ModalPlugin,
+    gitlab.gitlabAuthPlugin,
+    poe.PoeAuthPlugin,
+    cloudflare.CloudflareWorkersAuthPlugin,
+    cloudflare.CloudflareAIGatewayAuthPlugin,
+    azure.AzureAuthPlugin,
+    digitalocean.DigitalOceanAuthPlugin,
+    snowflake.SnowflakeCortexAuthPlugin,
+    xai.XaiAuthPlugin,
+    cerebras.CerebrasPlugin,
   ]
 }
 
@@ -134,6 +150,13 @@ const layer = Layer.effect(
     const state = yield* InstanceState.make<State>(
       Effect.fn("Plugin.state")(function* (ctx) {
         const hooks: Hooks[] = []
+        const cfg = yield* config.get()
+        const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])
+
+        // In the optimized one-shot runner both default and external plugins are
+        // disabled. Return before constructing the SDK client/server bridge.
+        if (flags.disableDefaultPlugins && plugins.length === 0) return { hooks }
+
         const bridge = yield* EffectBridge.make()
 
         function publishPluginError(message: string) {
@@ -149,7 +172,6 @@ const layer = Layer.effect(
           headers: ServerAuth.headers(),
           ...(serverUrl ? {} : { fetch: async (...args) => Server.Default().app.fetch(...args) }),
         })
-        const cfg = yield* config.get()
         const input: PluginInput = {
           client,
           project: ctx.project,
@@ -167,7 +189,8 @@ const layer = Layer.effect(
           $: typeof Bun === "undefined" ? undefined : Bun.$,
         }
 
-        for (const plugin of flags.disableDefaultPlugins ? [] : internalPlugins(flags)) {
+        const defaults = flags.disableDefaultPlugins ? [] : yield* Effect.promise(() => internalPlugins(flags))
+        for (const plugin of defaults) {
           const init = yield* Effect.tryPromise({
             try: () => plugin(input),
             catch: errorMessage,
@@ -178,7 +201,6 @@ const layer = Layer.effect(
           if (init._tag === "Some") hooks.push(init.value)
         }
 
-        const plugins = flags.pure ? [] : (cfg.plugin_origins ?? [])
         if (flags.pure && cfg.plugin_origins?.length) {
         }
         if (plugins.length) yield* config.waitForDependencies()
