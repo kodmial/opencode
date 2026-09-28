@@ -7,6 +7,8 @@ on:
     paths:
       - ".github/workflows/bootstrap-opencode.yml"
   workflow_dispatch:
+  issues:
+    types: [opened]
 
 permissions:
   contents: read
