@@ -41,8 +41,9 @@ jobs:
           BIN=packages/opencode/dist/opencode-linux-x64/bin/opencode
           test -x "$BIN"
           "$BIN" --version
-          "$BIN" --help | grep -q "run"
-          if "$BIN" --help | grep -Eq "(^|[[:space:]])(web|serve|attach|upgrade|uninstall)([[:space:]]|$)"; then
+          HELP="$($BIN --help 2>&1)"
+          grep -q "opencode run" <<<"$HELP"
+          if grep -Eq "(^|[[:space:]])(web|serve|attach|upgrade|uninstall)([[:space:]]|$)" <<<"$HELP"; then
             echo "::error::Non-coding commands leaked into the optimized CLI"
             exit 1
           fi
