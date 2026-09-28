@@ -18,6 +18,8 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      EXPECTED_OPENCODE_VERSION: "1.18.33"
 
     steps:
       - name: Checkout
@@ -31,7 +33,19 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Validate source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(jq -r '.version' packages/opencode/package.json)"
+          if [[ "$PACKAGE_VERSION" != "$EXPECTED_OPENCODE_VERSION" ]]; then
+            echo "::error::Source package version '$PACKAGE_VERSION' does not match expected base version '$EXPECTED_OPENCODE_VERSION'"
+            exit 1
+          fi
+
       - name: Build coding runner
+        env:
+          OPENCODE_VERSION: ${{ env.EXPECTED_OPENCODE_VERSION }}
         run: bun run --cwd packages/opencode build:coding
 
       - name: Verify coding runner
@@ -40,7 +54,12 @@ jobs:
           set -euo pipefail
           BIN=packages/opencode/dist/opencode-linux-x64/bin/opencode
           test -x "$BIN"
-          "$BIN" --version
+          ACTUAL_VERSION="$("$BIN" --version | tr -d '\r\n')"
+          if [[ "$ACTUAL_VERSION" != "$EXPECTED_OPENCODE_VERSION" ]]; then
+            echo "::error::Built binary version '$ACTUAL_VERSION' does not exactly match expected '$EXPECTED_OPENCODE_VERSION'"
+            exit 1
+          fi
+          echo "Verified OpenCode version: $ACTUAL_VERSION"
           HELP="$($BIN --help 2>&1)"
           grep -q "opencode run" <<<"$HELP"
           if grep -Eq "(^|[[:space:]])(web|serve|attach|upgrade|uninstall)([[:space:]]|$)" <<<"$HELP"; then
@@ -66,7 +85,8 @@ jobs:
             echo "source_sha=$GITHUB_SHA"
             echo "source_ref=$GITHUB_REF"
             echo "build_target=linux-x64-glibc"
-            echo "build_command=bun run --cwd packages/opencode build:coding"
+            echo "build_command=OPENCODE_VERSION=$EXPECTED_OPENCODE_VERSION bun run --cwd packages/opencode build:coding"
+            echo "opencode_version=$EXPECTED_OPENCODE_VERSION"
           } > "$OUT/build-metadata.txt"
           ls -lh "$OUT"
 
