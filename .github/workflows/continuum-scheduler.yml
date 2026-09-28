@@ -1,0 +1,24 @@
+name: Continuum scheduler
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".continuum.yml"
+      - ".github/workflows/continuum-scheduler.yml"
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+jobs:
+  schedule:
+    uses: kodmial/continuum/.github/workflows/consumer-scheduler.yml@main
+    with:
+      opencode_workflow: continuum-opencode.yml
+      wip_limit: 4
+      lease_minutes: 45
+      max_attempts: 2

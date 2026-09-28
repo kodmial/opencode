@@ -1,0 +1,7 @@
+# Continuum consumer configuration for the OpenCode optimization fork.
+# Review/release automation stays disabled while the local OpenCode execution
+# path is being prepared.
+version: 1
+
+review:
+  provider: none
