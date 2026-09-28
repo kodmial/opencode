@@ -31,5 +31,19 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Typecheck OpenCode
-        run: bun run --cwd packages/opencode typecheck
+      - name: Build coding runner
+        run: bun run --cwd packages/opencode build --single --skip-embed-web-ui --skip-install
+
+      - name: Verify coding runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=packages/opencode/dist/opencode-linux-x64/bin/opencode
+          test -x "$BIN"
+          "$BIN" --version
+          "$BIN" --help | grep -q "run"
+          if "$BIN" --help | grep -Eq "(^|[[:space:]])(web|serve|attach|upgrade|uninstall)([[:space:]]|$)"; then
+            echo "::error::Non-coding commands leaked into the optimized CLI"
+            exit 1
+          fi
+          ls -lh "$BIN"
