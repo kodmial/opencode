@@ -447,36 +447,40 @@ const layer = Layer.effect(
             }
           }
 
-          yield* ensureGitignore(dir).pipe(Effect.orDie)
+          if (!Flag.OPENCODE_CODING_ONLY) {
+            yield* ensureGitignore(dir).pipe(Effect.orDie)
 
-          const dep = yield* npmSvc
-            .install(dir, {
-              add: [
-                {
-                  name: "@opencode-ai/plugin",
-                  version: InstallationLocal ? undefined : InstallationVersion,
-                },
-              ],
-            })
-            .pipe(
-              Effect.exit,
-              Effect.tap((exit) =>
-                Exit.isFailure(exit)
-                  ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
-                  : Effect.void,
-              ),
-              Effect.asVoid,
-              Effect.forkDetach,
-            )
-          deps.push(dep)
+            const dep = yield* npmSvc
+              .install(dir, {
+                add: [
+                  {
+                    name: "@opencode-ai/plugin",
+                    version: InstallationLocal ? undefined : InstallationVersion,
+                  },
+                ],
+              })
+              .pipe(
+                Effect.exit,
+                Effect.tap((exit) =>
+                  Exit.isFailure(exit)
+                    ? Effect.logWarning("background dependency install failed", { dir, error: String(exit.cause) })
+                    : Effect.void,
+                ),
+                Effect.asVoid,
+                Effect.forkDetach,
+              )
+            deps.push(dep)
+          }
 
           result.command = mergeDeep(result.command ?? {}, yield* Effect.promise(() => ConfigCommand.load(dir)))
           result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.load(dir)))
           result.agent = mergeDeep(result.agent ?? {}, yield* Effect.promise(() => ConfigAgent.loadMode(dir)))
-          // Auto-discovered plugins under `.opencode/plugin(s)` are already local files, so ConfigPlugin.load
-          // returns normalized Specs and we only need to attach origin metadata here.
-          const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
-          yield* mergePluginOrigins(dir, list)
+          // Pure coding mode never executes external plugins, so avoid scanning them
+          // and, more importantly, avoid the background package installation above.
+          if (!Flag.OPENCODE_CODING_ONLY) {
+            const list = yield* Effect.promise(() => ConfigPlugin.load(dir))
+            yield* mergePluginOrigins(dir, list)
+          }
         }
 
         if (process.env.OPENCODE_CONFIG_CONTENT) {
@@ -595,6 +599,19 @@ const layer = Layer.effect(
         }
         if (Flag.OPENCODE_DISABLE_PRUNE) {
           result.compaction = { ...result.compaction, prune: false }
+        }
+
+        if (Flag.OPENCODE_CODING_ONLY) {
+          // The autonomous coding runner intentionally trades interactive IDE
+          // conveniences for a much smaller and more deterministic memory envelope.
+          // MCP and builtin web search are deliberately left untouched.
+          result.lsp = false
+          result.formatter = false
+          result.snapshot = false
+          result.share = "disabled"
+          result.autoshare = false
+          result.plugin = []
+          result.plugin_origins = []
         }
 
         return {
