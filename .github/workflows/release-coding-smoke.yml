@@ -2,19 +2,36 @@ name: OpenCode coding release smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact OpenCode source SHA to build; defaults to the triggering commit"
+        required: false
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - "packages/opencode/**"
   push:
     branches: [main]
     paths:
+      - "packages/opencode/**"
       - ".github/workflows/release-coding-smoke.yml"
 
 permissions:
+  actions: write
   contents: write
+  issues: write
+
+concurrency:
+  group: coding-release-${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: kodmial/continuum/.github/workflows/release-bun-binary.yml@main
     with:
-      source_sha: 842157c38db9f8178ed0eee7af32f7536fe2346e
+      source_sha: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
       package_dir: packages/opencode
       build_argv_json: '["bun","run","--cwd","packages/opencode","script/build.ts","--single","--coding","--skip-install","--skip-embed-web-ui"]'
       build_env_json: '{"OPENCODE_VERSION":"1.18.33"}'
@@ -24,3 +41,71 @@ jobs:
       bun_version: "1.3.14"
       prerelease: true
       expected_version: "1.18.33"
+
+  queue-validation:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      MODEL: opencode/muse-spark-1.3-contributor-free
+      VERSION: "1.18.33"
+    steps:
+      - name: Queue exactly one validation task for this immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "::error::invalid source SHA: $SOURCE_SHA"
+            exit 1
+          }
+
+          SHORT_SHA="${SOURCE_SHA:0:12}"
+          TAG="coding-smoke-v${VERSION}-${SHORT_SHA}"
+          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          ASSET_ID="$(jq -r '.assets[] | select(.name == "opencode-coding-linux-x64") | .id' <<<"$RELEASE_JSON" | head -1)"
+          [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::release $TAG does not contain opencode-coding-linux-x64"
+            exit 1
+          }
+
+          marker="<!-- execution:release-zen-e2e source_sha=$SOURCE_SHA -->"
+          existing="$(
+            gh api --method GET search/issues               -f q="repo:$GITHUB_REPOSITORY is:issue $SOURCE_SHA in:body"               --jq --arg marker "$marker" '.items[] | select((.body // "") | contains($marker)) | .number'               2>/dev/null | head -1 || true
+          )"
+          if [[ -n "$existing" ]]; then
+            echo "Validation issue #$existing already exists for $SOURCE_SHA."
+          else
+            body="$RUNNER_TEMP/validation-issue.md"
+            cat > "$body" <<EOF
+          $marker
+
+          ## Goal
+
+          Validate the exact immutable coding-only OpenCode release produced from source `$SOURCE_SHA`.
+          A failed validation is a completed experiment, not an automation failure: record the evidence,
+          close this validation task, and return the optimization loop to issue #14.
+
+          - model ID: `$MODEL`
+          - source SHA: `$SOURCE_SHA`
+          - release tag: `$TAG`
+          - release asset ID: `$ASSET_ID`
+          - release asset: `opencode-coding-linux-x64`
+
+          ## Required checks
+
+          1. Verify release metadata, source SHA and bundled SHA-256 before execution.
+          2. Make a real anonymous Zen request and require the exact marker `MUSE13_OK`.
+          3. Run a disposable coding task that reads/searches, edits a file and runs its test.
+          4. Verify no TUI/OpenTUI, LSP, formatter or plugin-install process starts.
+          5. Publish structured evidence. PASS, PARTIAL and FAIL are all terminal experiment results.
+          EOF
+            url="$(gh issue create               --repo "$GITHUB_REPOSITORY"               --title "P0: Validate coding release $SHORT_SHA on anonymous Zen"               --label "priority:p0"               --body-file "$body")"
+            echo "Created validation task: $url"
+          fi
+
+          gh workflow run continuum-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
