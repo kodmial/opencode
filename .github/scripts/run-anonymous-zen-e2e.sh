@@ -15,6 +15,12 @@ fi
 
 BIN="$ARTIFACT_DIR/opencode-coding-linux-x64"
 CHECKSUM="$ARTIFACT_DIR/opencode-coding-linux-x64.sha256"
+# GitHub Actions artifacts do not preserve executable bits. Restoring the mode
+# is packaging normalization, not a binary/content modification; identity is
+# still verified by SHA-256 immediately below.
+if [[ -f "$BIN" ]]; then
+  chmod 0755 "$BIN"
+fi
 METADATA="$ARTIFACT_DIR/build-metadata.txt"
 RUN_URL="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 TEST_COMMAND="python3 test_calc.py"
