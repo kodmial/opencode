@@ -9,6 +9,9 @@ MODEL="${MODEL:?MODEL is required}"
 SOURCE_SHA="${SOURCE_SHA:?SOURCE_SHA is required}"
 ARTIFACT_ID="${ARTIFACT_ID:?ARTIFACT_ID is required}"
 ARTIFACT_DIR="${ARTIFACT_DIR:?ARTIFACT_DIR is required}"
+if [[ -d "$ARTIFACT_DIR/opencode-coding-linux-x64" ]]; then
+  ARTIFACT_DIR="$ARTIFACT_DIR/opencode-coding-linux-x64"
+fi
 
 BIN="$ARTIFACT_DIR/opencode-coding-linux-x64"
 CHECKSUM="$ARTIFACT_DIR/opencode-coding-linux-x64.sha256"
