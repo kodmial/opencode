@@ -42,9 +42,10 @@ jobs:
       prerelease: true
       expected_version: "1.18.33"
 
-  queue-validation:
+  validate:
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       actions: write
       contents: read
@@ -52,10 +53,19 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      SOURCE_KIND: release
       MODEL: opencode/muse-spark-1.3-contributor-free
       VERSION: "1.18.33"
+      ISSUE_NUMBER: "14"
     steps:
-      - name: Queue exactly one validation task for this immutable release
+      - name: Checkout current validation harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Download exact immutable release assets
+        id: release_meta
         shell: bash
         run: |
           set -euo pipefail
@@ -73,39 +83,86 @@ jobs:
             exit 1
           }
 
-          marker="<!-- execution:release-zen-e2e source_sha=$SOURCE_SHA -->"
-          existing="$(
-            gh api --method GET search/issues               -f q="repo:$GITHUB_REPOSITORY is:issue $SOURCE_SHA in:body"               --jq --arg marker "$marker" '.items[] | select((.body // "") | contains($marker)) | .number'               2>/dev/null | head -1 || true
-          )"
-          if [[ -n "$existing" ]]; then
-            echo "Validation issue #$existing already exists for $SOURCE_SHA."
-          else
-            body="$RUNNER_TEMP/validation-issue.md"
-            cat > "$body" <<EOF
-          $marker
+          mkdir -p "$RUNNER_TEMP/coding-artifact"
+          gh release download "$TAG"             --repo "$GITHUB_REPOSITORY"             --pattern 'opencode-coding-linux-x64*'             --dir "$RUNNER_TEMP/coding-artifact"
 
-          ## Goal
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_id=$ASSET_ID" >> "$GITHUB_OUTPUT"
 
-          Validate the exact immutable coding-only OpenCode release produced from source `$SOURCE_SHA`.
-          A failed validation is a completed experiment, not an automation failure: record the evidence,
-          close this validation task, and return the optimization loop to issue #14.
+      - name: Run real anonymous Zen coding validation
+        id: e2e
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+          ARTIFACT_ID: ${{ steps.release_meta.outputs.asset_id }}
+          ARTIFACT_DIR: ${{ runner.temp }}/coding-artifact
+        run: bash .github/scripts/run-anonymous-zen-e2e.sh
 
-          - model ID: `$MODEL`
-          - source SHA: `$SOURCE_SHA`
-          - release tag: `$TAG`
-          - release asset ID: `$ASSET_ID`
-          - release asset: `opencode-coding-linux-x64`
+      - name: Upload structured validation result
+        id: result_artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-coding-zen-e2e-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/opencode-anonymous-zen-e2e/
+          if-no-files-found: error
+          retention-days: 30
 
-          ## Required checks
-
-          1. Verify release metadata, source SHA and bundled SHA-256 before execution.
-          2. Make a real anonymous Zen request and require the exact marker `MUSE13_OK`.
-          3. Run a disposable coding task that reads/searches, edits a file and runs its test.
-          4. Verify no TUI/OpenTUI, LSP, formatter or plugin-install process starts.
-          5. Publish structured evidence. PASS, PARTIAL and FAIL are all terminal experiment results.
-          EOF
-            url="$(gh issue create               --repo "$GITHUB_REPOSITORY"               --title "P0: Validate coding release $SHORT_SHA on anonymous Zen"               --label "priority:p0"               --body-file "$body")"
-            echo "Created validation task: $url"
+      - name: Feed result back into the optimization loop
+        if: always()
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+          ARTIFACT_ID: ${{ steps.release_meta.outputs.asset_id }}
+          RESULT_ARTIFACT_URL: ${{ steps.result_artifact.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          JSON="$RUNNER_TEMP/opencode-anonymous-zen-e2e/result.json"
+          if [[ ! -f "$JSON" ]]; then
+            mkdir -p "$(dirname "$JSON")"
+            jq -n               --arg SOURCE_SHA "$SOURCE_SHA"               --arg ARTIFACT_ID "${ARTIFACT_ID:-unknown}"               --arg MODEL "$MODEL"               --arg RUN_URL "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"               '{RESULT:"FAIL",ARTIFACT_ID:$ARTIFACT_ID,SOURCE_SHA:$SOURCE_SHA,BINARY_SHA256:"",MODEL:$MODEL,AUTH_MODE:"anonymous/no API key",MINIMAL_REQUEST:"fail",MINIMAL_EXIT_CODE:"not-run",MINIMAL_RESPONSE:"validation harness failed before producing result.json",CODING_LOOP:"fail",TOOLS_OBSERVED:"none",FILE_EDIT_CONFIRMED:"no",TEST_COMMAND:"python3 test_calc.py",TEST_EXIT_CODE:"not-run",RUNTIME_INVARIANTS:"fail",ACTIONS_RUN:$RUN_URL,NOTES:"validation harness failure"}'               > "$JSON"
           fi
 
-          gh workflow run continuum-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
+          RESULT="$(jq -r '.RESULT // "FAIL"' "$JSON")"
+          marker="<!-- coding-release-validation source_sha=$SOURCE_SHA -->"
+          body="$RUNNER_TEMP/optimization-result.md"
+          cat > "$body" <<EOF
+          $marker
+          Immutable coding release validation: **$RESULT**
+
+          - source SHA: `$SOURCE_SHA`
+          - release tag: `${RELEASE_TAG:-unknown}`
+          - release asset ID: `${ARTIFACT_ID:-unknown}`
+          - binary SHA-256: `$(jq -r '.BINARY_SHA256 // ""' "$JSON")`
+          - minimal request: `$(jq -r '.MINIMAL_REQUEST // ""' "$JSON")`
+          - coding loop: `$(jq -r '.CODING_LOOP // ""' "$JSON")`
+          - runtime invariants: `$(jq -r '.RUNTIME_INVARIANTS // ""' "$JSON")`
+          - workflow: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - detailed result artifact: ${RESULT_ARTIFACT_URL:-not available}
+
+          This exact immutable artifact is terminal. Do not retry it automatically.
+          EOF
+
+          existing="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/14/comments"               --jq ".[] | select((.body // \"\") | contains(\"$marker\")) | .id"               2>/dev/null | head -1 || true
+          )"
+          if [[ -z "$existing" ]]; then
+            gh issue comment 14 --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          fi
+
+          if [[ "$RESULT" != "PASS" ]]; then
+            gh issue reopen 14 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            gh issue edit 14 --repo "$GITHUB_REPOSITORY" --add-label "priority:p0" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/14/labels/automation:paused" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/14/labels/automation:in-progress" >/dev/null 2>&1 || true
+            gh workflow run continuum-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
+          fi
+
+      - name: Mark validation failure without blocking the next optimization
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          JSON="$RUNNER_TEMP/opencode-anonymous-zen-e2e/result.json"
+          [[ -f "$JSON" ]] || exit 1
+          [[ "$(jq -r '.RESULT' "$JSON")" == "PASS" ]]
