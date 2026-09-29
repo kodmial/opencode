@@ -105,7 +105,55 @@ jobs:
       repair_agent_timeout_seconds: ${{ inputs.repair_agent_timeout_seconds }}
     secrets:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      AUTOMATION_TOKEN: ${{ secrets.TAP_PAT }}
+
+  publish-fallback:
+    needs: [route, continuum]
+    if: >-
+      always() &&
+      inputs.mode == 'issue' &&
+      needs.route.outputs.local_e2e != 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.TAP_PAT }}
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+    steps:
+      - name: Publish any completed Continuum branch missing a PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || exit 0
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::warning::TAP_PAT is unavailable; PR publication fallback is skipped."
+            exit 0
+          fi
+
+          PREFIX="opencode/issue${ISSUE_NUMBER}-"
+          while read -r ref; do
+            [[ -n "$ref" ]] || continue
+            branch="${ref#refs/heads/}"
+            open_pr="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$branch" --state open --json number --jq '.[0].number // empty')"
+            if [[ -n "$open_pr" ]]; then
+              echo "PR #$open_pr already owns $branch."
+              exit 0
+            fi
+
+            ahead="$(gh api "repos/$GITHUB_REPOSITORY/compare/main...${branch}" --jq '.ahead_by // 0' 2>/dev/null || echo 0)"
+            [[ "$ahead" =~ ^[0-9]+$ ]] || ahead=0
+            (( ahead > 0 )) || continue
+
+            title="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json title --jq .title)"
+            gh pr create               --repo "$GITHUB_REPOSITORY"               --base main               --head "$branch"               --title "$title"               --body "Implemented automatically by Continuum.\n\nCloses #${ISSUE_NUMBER}"
+            echo "Published missing PR for $branch using the caller repository token."
+            exit 0
+          done < <(
+            gh api --paginate               "repos/$GITHUB_REPOSITORY/git/matching-refs/heads/${PREFIX}"               --jq '.[].ref' 2>/dev/null || true
+          )
+
+          echo "No completed unpublished Continuum branch found for issue #$ISSUE_NUMBER."
 
   anonymous-zen-e2e:
     needs: route
