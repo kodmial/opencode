@@ -27,6 +27,20 @@ on:
         description: "Failed workflow run id"
         required: false
         type: string
+      rungs_ruled_out:
+        description: "Comma-separated mechanical conflict-repair rungs already attempted"
+        required: false
+        type: string
+      repair_timeout_minutes:
+        description: "Maximum conflict-repair runtime"
+        required: false
+        type: number
+        default: 25
+      repair_agent_timeout_seconds:
+        description: "Hard cap for the repair model call"
+        required: false
+        type: number
+        default: 1200
 
 permissions:
   actions: read
@@ -86,6 +100,9 @@ jobs:
       pr_number: ${{ inputs.pr_number }}
       head_ref: ${{ inputs.head_ref }}
       run_id: ${{ inputs.run_id }}
+      rungs_ruled_out: ${{ inputs.rungs_ruled_out }}
+      repair_timeout_minutes: ${{ inputs.repair_timeout_minutes }}
+      repair_agent_timeout_seconds: ${{ inputs.repair_agent_timeout_seconds }}
     secrets:
       OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
       AUTOMATION_TOKEN: ${{ secrets.TAP_PAT }}
