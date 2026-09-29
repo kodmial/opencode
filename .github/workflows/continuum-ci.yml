@@ -31,8 +31,11 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify coding bundle pruning
+        run: bun test packages/opencode/test/cli/run/coding-bundle.test.ts
+
       - name: Build coding runner
-        run: bun run --cwd packages/opencode build --single --skip-embed-web-ui --skip-install
+        run: bun run --cwd packages/opencode script/build.ts --single --coding --skip-embed-web-ui --skip-install
 
       - name: Verify coding runner
         shell: bash
