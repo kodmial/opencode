@@ -6,6 +6,7 @@ import type { Agent } from "../agent/agent"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { evaluate } from "@/permission/evaluate"
 import { Config } from "@/config/config"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ToolID } from "./schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
 
@@ -13,6 +14,11 @@ const RETENTION = Duration.days(7)
 
 export const MAX_LINES = 2000
 export const MAX_BYTES = 50 * 1024
+// Headless coding runs have no UI to read a large inline preview and every
+// byte kept inline is re-hydrated on each provider turn, so the stripped runner
+// externalizes far earlier and keeps a much smaller copy in the transcript.
+export const LOW_MEMORY_MAX_LINES = 500
+export const LOW_MEMORY_MAX_BYTES = 12 * 1024
 export const DIR = TRUNCATION_DIR
 export const GLOB = path.join(TRUNCATION_DIR, "*")
 
@@ -27,6 +33,17 @@ export interface Options {
 function hasTaskTool(agent?: Agent.Info) {
   if (!agent?.permission) return false
   return evaluate("task", "*", agent.permission).action !== "deny"
+}
+
+function countLines(text: string) {
+  if (text.length === 0) return 0
+  let count = 1
+  let index = text.indexOf("\n")
+  while (index !== -1) {
+    count++
+    index = text.indexOf("\n", index + 1)
+  }
+  return count
 }
 
 export interface Interface {
@@ -73,12 +90,19 @@ const layer = Layer.effect(
     })
 
     const limits = Effect.fn("Truncate.limits")(function* () {
+      const flags = yield* Effect.serviceOption(RuntimeFlags.Service)
+      const lowMemory = Option.isSome(flags) ? flags.value.lowMemory : false
       const configSvc = yield* Effect.serviceOption(Config.Service)
-      if (Option.isNone(configSvc)) return { maxLines: MAX_LINES, maxBytes: MAX_BYTES }
+      if (Option.isNone(configSvc)) {
+        return {
+          maxLines: lowMemory ? LOW_MEMORY_MAX_LINES : MAX_LINES,
+          maxBytes: lowMemory ? LOW_MEMORY_MAX_BYTES : MAX_BYTES,
+        }
+      }
       const cfg = yield* configSvc.value.get().pipe(Effect.catch(() => Effect.succeed(undefined)))
       return {
-        maxLines: cfg?.tool_output?.max_lines ?? MAX_LINES,
-        maxBytes: cfg?.tool_output?.max_bytes ?? MAX_BYTES,
+        maxLines: cfg?.tool_output?.max_lines ?? (lowMemory ? LOW_MEMORY_MAX_LINES : MAX_LINES),
+        maxBytes: cfg?.tool_output?.max_bytes ?? (lowMemory ? LOW_MEMORY_MAX_BYTES : MAX_BYTES),
       }
     })
 
@@ -87,13 +111,16 @@ const layer = Layer.effect(
       const maxLines = options.maxLines ?? resolved.maxLines
       const maxBytes = options.maxBytes ?? resolved.maxBytes
       const direction = options.direction ?? "head"
-      const lines = text.split("\n")
       const totalBytes = Buffer.byteLength(text, "utf-8")
 
-      if (lines.length <= maxLines && totalBytes <= maxBytes) {
+      // Splitting the whole payload just to discover that it fits doubles the
+      // peak footprint of every large tool result, so count separators first
+      // and only materialize lines when a truncation is actually required.
+      if (countLines(text) <= maxLines && totalBytes <= maxBytes) {
         return { content: text, truncated: false } as const
       }
 
+      const lines = text.split("\n")
       const out: string[] = []
       let i = 0
       let bytes = 0
