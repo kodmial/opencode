@@ -32,7 +32,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Verify coding bundle pruning
-        run: bun test packages/opencode/test/cli/run/coding-bundle.test.ts
+        run: cd packages/opencode && bun test test/cli/run/coding-bundle.test.ts
 
       - name: Build coding runner
         run: bun run --cwd packages/opencode script/build.ts --single --coding --skip-embed-web-ui --skip-install
