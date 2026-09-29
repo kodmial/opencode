@@ -6,6 +6,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Effect, FileSystem } from "effect"
 import { Truncate } from "@/tool/truncate"
 import { Config } from "@/config/config"
+import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Identifier } from "../../src/id/id"
 import { Process } from "@/util/process"
 import path from "path"
@@ -23,6 +24,11 @@ const configuredLayer = (cfg: ConfigV1.Info) =>
     [Config.node, TestConfig.layer({ get: () => Effect.succeed(cfg) })],
   ])
 const configuredIt = (cfg: ConfigV1.Info) => testEffect(configuredLayer(cfg))
+
+const lowMemoryLayer = LayerNode.compile(LayerNode.group([Truncate.node, FSUtil.node, filesystem, RuntimeFlags.node]), [
+  [RuntimeFlags.node, RuntimeFlags.layer({ lowMemory: true })],
+])
+const lowMemoryIt = testEffect(lowMemoryLayer)
 
 describe("Truncate", () => {
   describe("output", () => {
@@ -103,6 +109,79 @@ describe("Truncate", () => {
     test("uses default MAX_LINES and MAX_BYTES", () => {
       expect(Truncate.MAX_LINES).toBe(2000)
       expect(Truncate.MAX_BYTES).toBe(50 * 1024)
+    })
+
+    it.live("counts a single line without extra separators as one line", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        // maxLines: 1 keeps the text under the limit, so this only passes when
+        // the line count is derived from actual separators.
+        const result = yield* svc.output("only line", { maxLines: 1 })
+        expect(result.truncated).toBe(false)
+      }),
+    )
+
+    it.live("returns empty content unchanged when under limits", () =>
+      Effect.gen(function* () {
+        const result = yield* (yield* Truncate.Service).output("")
+        expect(result.truncated).toBe(false)
+        if (result.truncated) throw new Error("expected not truncated")
+        expect(result.content).toBe("")
+      }),
+    )
+
+    it.live("passes through content that fits but has a trailing newline", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const content = "a\nb\nc\n"
+        const result = yield* svc.output(content, { maxLines: 4 })
+        expect(result.truncated).toBe(false)
+        expect(result.content).toBe(content)
+      }),
+    )
+
+    it.live("returns content unchanged when byte length is exactly at the limit", () =>
+      Effect.gen(function* () {
+        const svc = yield* Truncate.Service
+        const content = "a".repeat(100)
+        const result = yield* svc.output(content, { maxBytes: 100 })
+        expect(result.truncated).toBe(false)
+        expect(result.content).toBe(content)
+      }),
+    )
+
+    describe("with low-memory runtime", () => {
+      lowMemoryIt.live("limits() uses the smaller externalization threshold", () =>
+        Effect.gen(function* () {
+          const resolved = yield* (yield* Truncate.Service).limits()
+          expect(resolved.maxLines).toBe(Truncate.LOW_MEMORY_MAX_LINES)
+          expect(resolved.maxBytes).toBe(Truncate.LOW_MEMORY_MAX_BYTES)
+          expect(resolved.maxBytes).toBeLessThan(Truncate.MAX_BYTES)
+        }),
+      )
+
+      lowMemoryIt.live("output() externalizes content that fits the interactive limits", () =>
+        Effect.gen(function* () {
+          const svc = yield* Truncate.Service
+          const content = "a".repeat(Truncate.MAX_BYTES - 1)
+          const result = yield* svc.output(content)
+          expect(result.truncated).toBe(true)
+          if (!result.truncated) throw new Error("expected truncated")
+          const written = yield* (yield* FSUtil.Service).readFileString(result.outputPath)
+          expect(written).toBe(content)
+        }),
+      )
+
+      lowMemoryIt.live("per-call options still win in low-memory mode", () =>
+        Effect.gen(function* () {
+          const content = "a".repeat(1000)
+          const result = yield* (yield* Truncate.Service).output(content, {
+            maxBytes: 1024 * 1024,
+            maxLines: 1_000_000,
+          })
+          expect(result.truncated).toBe(false)
+        }),
+      )
     })
 
     it.live("limits() falls back to MAX_LINES/MAX_BYTES when Config is not provided", () =>

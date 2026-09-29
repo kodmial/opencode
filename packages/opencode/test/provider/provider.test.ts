@@ -1200,6 +1200,23 @@ it.instance("ModelNotFoundError suggests catalog models for unloaded providers",
   }),
 )
 
+it.instance(
+  "catalog suggestions survive the provider model whitelist",
+  Effect.gen(function* () {
+    yield* setProcessEnv("ANTHROPIC_API_KEY", "test-api-key")
+    const providers = yield* list
+    // The credentialed provider view is emptied by the whitelist and dropped...
+    expect(providers[ProviderV2.ID.anthropic]).toBeUndefined()
+    // ...but the catalog behind ModelNotFoundError suggestions stays complete.
+    const error = yield* Provider.use
+      .getModel(ProviderV2.ID.anthropic, ModelV2.ID.make("claude-haiku-4-5-fake"))
+      .pipe(Effect.flip)
+    if (!Provider.ModelNotFoundError.isInstance(error)) throw error
+    expect(error.suggestions ?? []).toContain("claude-haiku-4-5")
+  }),
+  { config: { provider: { anthropic: { whitelist: ["nonexistent-model"] } } } },
+)
+
 it.instance("getProvider returns undefined for nonexistent provider", () =>
   Effect.gen(function* () {
     const provider = yield* Provider.Service.use((svc) => svc.getProvider(ProviderV2.ID.make("nonexistent")))

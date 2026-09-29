@@ -1259,7 +1259,8 @@ export interface Interface {
 interface State {
   models: Map<string, LanguageModelV3>
   providers: Record<ProviderV2.ID, Info>
-  catalog: Record<ProviderV2.ID, Info>
+  catalog: (providerID: ProviderV2.ID) => Info | undefined
+  catalogIDs: () => string[]
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
@@ -1453,8 +1454,34 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
-        const catalog = mapValues(modelsDev, fromModelsDevProvider)
-        const database = mapValues(catalog, toPublicInfo)
+        // models.dev carries thousands of models for every provider it knows.
+        // Building the whole catalog up front - and then again through
+        // toPublicInfo - dominated startup RSS for a worker that only ever
+        // touches one provider, so each provider is converted on first use and
+        // memoized from there. The raw and public views stay separate because
+        // the initialization below mutates the public one (blacklists, alpha and
+        // deprecated removals) and must not corrupt suggestion lookups.
+        const rawCatalog = new Map<ProviderV2.ID, Info>()
+        const publicCatalog = new Map<ProviderV2.ID, Info>()
+        const catalogIDs = Object.keys(modelsDev)
+        const catalog = (providerID: ProviderV2.ID) => {
+          const cached = rawCatalog.get(providerID)
+          if (cached) return cached
+          const raw = modelsDev[providerID]
+          if (!raw) return undefined
+          const info = fromModelsDevProvider(raw)
+          rawCatalog.set(providerID, info)
+          return info
+        }
+        const database = (providerID: ProviderV2.ID) => {
+          const cached = publicCatalog.get(providerID)
+          if (cached) return cached
+          const info = catalog(providerID)
+          if (!info) return undefined
+          const published = toPublicInfo(info)
+          publicCatalog.set(providerID, published)
+          return published
+        }
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1482,7 +1509,7 @@ const layer = Layer.effect(
             providers[providerID] = mergeDeep(existing, provider)
             return
           }
-          const match = database[providerID]
+          const match = database(providerID)
           if (!match) return
           // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
@@ -1510,7 +1537,7 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
 
-          const provider = database[providerID]
+          const provider = database(providerID)
           if (!provider) continue
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
@@ -1531,7 +1558,7 @@ const layer = Layer.effect(
 
         // extend database from config
         for (const [providerID, provider] of configProviders) {
-          const existing = database[providerID]
+          const existing = database(ProviderV2.ID.make(providerID))
           const parsed: Info = {
             id: ProviderV2.ID.make(providerID),
             name: provider.name ?? existing?.name ?? providerID,
@@ -1627,19 +1654,21 @@ const layer = Layer.effect(
             )
             parsed.models[modelID] = parsedModel
           }
-          database[providerID] = parsed
+          publicCatalog.set(ProviderV2.ID.make(providerID), parsed)
         }
 
-        // load env
+        // load env - read env names straight off the raw models.dev payload so
+        // credential discovery never forces the whole catalog into the heap
         const envs = yield* env.all()
-        for (const [id, provider] of Object.entries(database)) {
+        for (const id of new Set([...catalogIDs, ...publicCatalog.keys()])) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const apiKey = provider.env.map((item) => envs[item]).find(Boolean)
+          const names = modelsDev[id]?.env ?? publicCatalog.get(providerID)?.env ?? []
+          const apiKey = names.map((item) => envs[item]).find(Boolean)
           if (!apiKey) continue
           mergeProvider(providerID, {
             source: "env",
-            key: provider.env.length === 1 ? apiKey : undefined,
+            key: names.length === 1 ? apiKey : undefined,
           })
         }
 
@@ -1665,11 +1694,13 @@ const layer = Layer.effect(
           const stored = yield* auth.get(providerID).pipe(Effect.orDie)
           if (!stored) continue
           if (!plugin.auth.loader) continue
+          const info = database(providerID)
+          if (!info) continue
 
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
               () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
-              toPublicInfo(database[plugin.auth!.provider]),
+              toPublicInfo(info),
             ),
           )
           const opts = options ?? {}
@@ -1680,7 +1711,7 @@ const layer = Layer.effect(
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const data = database[providerID]
+          const data = database(providerID)
           if (!data) {
             continue
           }
@@ -1773,6 +1804,7 @@ const layer = Layer.effect(
           models: languages,
           providers,
           catalog,
+          catalogIDs: () => catalogIDs,
           sdk,
           modelLoaders,
           varsLoaders,
@@ -1895,11 +1927,11 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       const provider = s.providers[providerID]
       if (!provider) {
-        const catalogProvider = s.catalog[providerID]
+        const catalogProvider = s.catalog(providerID)
         const suggestions = catalogProvider
           ? modelSuggestions(catalogProvider, modelID, runtimeFlags.enableExperimentalModels)
           : fuzzysort
-              .go(providerID, Object.keys({ ...s.catalog, ...s.providers }), { limit: 3, threshold: -10000 })
+              .go(providerID, [...s.catalogIDs(), ...Object.keys(s.providers)], { limit: 3, threshold: -10000 })
               .map((m) => m.target)
         return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
       }
@@ -1909,7 +1941,7 @@ const layer = Layer.effect(
         const current = modelSuggestions(provider, modelID, runtimeFlags.enableExperimentalModels)
         const suggestions = current.length
           ? current
-          : modelSuggestions(s.catalog[providerID], modelID, runtimeFlags.enableExperimentalModels)
+          : modelSuggestions(s.catalog(providerID), modelID, runtimeFlags.enableExperimentalModels)
         return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
       }
       return info

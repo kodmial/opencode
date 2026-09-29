@@ -59,14 +59,14 @@ const fill = Effect.fn("Test.fill")(function* (
   return ids
 })
 
-const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?: string) {
+const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?: string, time = Date.now()) {
   const session = yield* SessionNs.Service
   const id = MessageID.ascending()
   yield* session.updateMessage({
     id,
     sessionID,
     role: "user",
-    time: { created: Date.now() },
+    time: { created: time },
     agent: "test",
     model: { providerID: "test", modelID: "test" },
     tools: {},
@@ -87,7 +87,7 @@ const addUser = Effect.fn("Test.addUser")(function* (sessionID: SessionID, text?
 const addAssistant = Effect.fn("Test.addAssistant")(function* (
   sessionID: SessionID,
   parentID: MessageID,
-  opts?: { summary?: boolean; finish?: string; error?: SessionV1.Assistant["error"] },
+  opts?: { summary?: boolean; finish?: string; error?: SessionV1.Assistant["error"]; time?: number },
 ) {
   const session = yield* SessionNs.Service
   const id = MessageID.ascending()
@@ -95,7 +95,7 @@ const addAssistant = Effect.fn("Test.addAssistant")(function* (
     id,
     sessionID,
     role: "assistant",
-    time: { created: Date.now() },
+    time: { created: opts?.time ?? Date.now() },
     parentID,
     modelID: ModelV2.ID.make("test"),
     providerID: ProviderV2.ID.make("test"),
@@ -1051,6 +1051,85 @@ describe("MessageV2 consistency", () => {
         const all = stream.toReversed()
 
         expect(filtered.map((m) => m.info.id)).toEqual(all.map((m) => m.info.id))
+      }),
+    ),
+  )
+})
+
+describe("MessageV2.activeEffect", () => {
+  it.instance("returns every message when the session has no compaction", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const ids = yield* fill(sessionID, 6)
+
+        const active = yield* MessageV2.activeEffect(sessionID)
+        expect(active.map((item) => item.info.id)).toEqual(ids)
+      }),
+    ),
+  )
+
+  it.instance("matches filterCompactedEffect when a compaction boundary exists", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const now = Date.now()
+        const u1 = yield* addUser(sessionID, "first question", now + 1)
+        const a1 = yield* addAssistant(sessionID, u1, { summary: true, finish: "end_turn", time: now + 2 })
+        yield* addCompactionPart(sessionID, u1)
+
+        const u2 = yield* addUser(sessionID, "second question", now + 3)
+        const a2 = yield* addAssistant(sessionID, u2, { time: now + 4 })
+        const u3 = yield* addUser(sessionID, "third question", now + 5)
+
+        const active = yield* MessageV2.activeEffect(sessionID)
+        const full = yield* MessageV2.filterCompactedEffect(sessionID)
+        expect(active.map((item) => item.info.id)).toEqual(full.map((item) => item.info.id))
+        expect(active.map((item) => item.info.id)).toEqual([u1, a1, u2, a2, u3])
+      }),
+    ),
+  )
+
+  it.instance("never hydrates history older than the retained tail", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        // More than one page of history that the compaction boundary discards.
+        const now = Date.now()
+        const dropped = yield* fill(sessionID, 60, (i: number) => now + i)
+        const tailStart = dropped.at(-1)!
+
+        const compaction = yield* addUser(sessionID, "compact me", now + 61)
+        const summary = yield* addAssistant(sessionID, compaction, {
+          summary: true,
+          finish: "end_turn",
+          time: now + 62,
+        })
+        yield* addCompactionPart(sessionID, compaction, tailStart)
+        const after = yield* addUser(sessionID, "carry on", now + 63)
+
+        const active = yield* MessageV2.activeEffect(sessionID)
+        const full = yield* MessageV2.filterCompactedEffect(sessionID)
+
+        expect(active.map((item) => item.info.id)).toEqual([compaction, summary, tailStart, after])
+        expect(active.map((item) => item.info.id)).toEqual(full.map((item) => item.info.id))
+      }),
+    ),
+  )
+
+  it.instance("stops at a compaction without a retained tail", () =>
+    withSession(({ sessionID }) =>
+      Effect.gen(function* () {
+        const now = Date.now()
+        yield* fill(sessionID, 4, (i: number) => now + i)
+        const compaction = yield* addUser(sessionID, "compact me", now + 5)
+        const summary = yield* addAssistant(sessionID, compaction, {
+          summary: true,
+          finish: "end_turn",
+          time: now + 6,
+        })
+        yield* addCompactionPart(sessionID, compaction)
+        const after = yield* addUser(sessionID, "carry on", now + 7)
+
+        const active = yield* MessageV2.activeEffect(sessionID)
+        expect(active.map((item) => item.info.id)).toEqual([compaction, summary, after])
       }),
     ),
   )

@@ -44,6 +44,10 @@ interface FetchDecompressionError extends Error {
 }
 
 export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
+// Replaces inline tool output once the payload has been externalized to the
+// tool-output directory. Shared by model replay and compaction serialization so
+// a pruned part renders identically everywhere.
+export const COMPACTED_OUTPUT = "[Old tool result content cleared]"
 export { isMedia }
 
 function truncateToolOutput(text: string, maxChars?: number) {
@@ -295,7 +299,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           toolNames.add(part.tool)
           if (part.state.status === "completed") {
             const outputText = part.state.time.compacted
-              ? "[Old tool result content cleared]"
+              ? COMPACTED_OUTPUT
               : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
             const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
@@ -470,6 +474,28 @@ export const page = Effect.fn("MessageV2.page")(function* (input: {
   }
 })
 
+// Tracks the newest completed compaction boundary while walking newest-first
+// history. Returns true once the boundary is reached, meaning everything older
+// can be skipped: it is already summarized and can never reach the model.
+function compactionBoundary() {
+  const completed = new Set<string>()
+  let retain: MessageID | undefined
+  return (msg: WithParts) => {
+    if (retain) return msg.info.id === retain
+    if (msg.info.role === "user" && completed.has(msg.info.id)) {
+      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
+      if (!part) return false
+      if (!part.tail_start_id) return true
+      if (msg.info.id === part.tail_start_id) return true
+      retain = part.tail_start_id
+      return false
+    }
+    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
+      completed.add(msg.info.parentID)
+    return false
+  }
+}
+
 export function stream(sessionID: SessionID) {
   const size = 50
   return Effect.gen(function* () {
@@ -487,6 +513,39 @@ export function stream(sessionID: SessionID) {
         if (item) result.push(item)
       }
       if (!next.more || !next.cursor) break
+      before = next.cursor
+    }
+    return result
+  })
+}
+
+// Same newest-first ordering as stream(), but stops paging at the compaction
+// boundary instead of materializing the whole session. Rows older than the
+// boundary stay on disk rather than entering the JS heap only to be discarded.
+export function streamActive(sessionID: SessionID) {
+  const size = 50
+  return Effect.gen(function* () {
+    const result = [] as WithParts[]
+    const boundary = compactionBoundary()
+    let before: string | undefined
+    let done = false
+    while (!done) {
+      const next = yield* page({ sessionID, limit: size, before }).pipe(
+        Effect.catchIf(NotFoundError.isInstance, () =>
+          Effect.succeed({ items: [] as WithParts[], cursor: undefined, more: false }),
+        ),
+      )
+      if (next.items.length === 0) break
+      for (let i = next.items.length - 1; i >= 0; i--) {
+        const item = next.items[i]
+        if (!item) continue
+        result.push(item)
+        if (boundary(item)) {
+          done = true
+          break
+        }
+      }
+      if (done || !next.more || !next.cursor) break
       before = next.cursor
     }
     return result
@@ -524,26 +583,10 @@ export const get = Effect.fn("MessageV2.get")(function* (input: { sessionID: Ses
 
 export function filterCompacted(msgs: Iterable<WithParts>) {
   const result = [] as WithParts[]
-  const completed = new Set<string>()
-  let retain: MessageID | undefined
+  const boundary = compactionBoundary()
   for (const msg of msgs) {
     result.push(msg)
-    if (retain) {
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id)) {
-      const part = msg.parts.find((item): item is CompactionPart => item.type === "compaction")
-      if (!part) continue
-      if (!part.tail_start_id) break
-      retain = part.tail_start_id
-      if (msg.info.id === retain) break
-      continue
-    }
-    if (msg.info.role === "user" && completed.has(msg.info.id) && msg.parts.some((part) => part.type === "compaction"))
-      break
-    if (msg.info.role === "assistant" && msg.info.summary && msg.info.finish && !msg.info.error)
-      completed.add(msg.info.parentID)
+    if (boundary(msg)) break
   }
   result.reverse()
   const compactionIndex = result.findLastIndex(
@@ -577,6 +620,13 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
   return filterCompacted(yield* stream(sessionID))
+})
+
+// Active context for the next model call: the compaction summary, the retained
+// tail, and everything after the compaction. Equivalent to
+// filterCompactedEffect(sessionID) but never hydrates the discarded prefix.
+export const activeEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
+  return filterCompacted(yield* streamActive(sessionID))
 })
 
 // filterCompacted reorders messages for model consumption
