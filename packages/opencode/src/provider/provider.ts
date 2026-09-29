@@ -1259,7 +1259,11 @@ export interface Interface {
 interface State {
   models: Map<string, LanguageModelV3>
   providers: Record<ProviderV2.ID, Info>
-  catalog: Record<ProviderV2.ID, Info>
+  // Provider catalog entries are converted from the models.dev snapshot on first touch
+  // and cached. The snapshot carries thousands of models across every provider, while a
+  // coding run only ever needs the handful it is configured for.
+  catalog: (providerID: ProviderV2.ID) => Info | undefined
+  catalogKeys: () => ReadonlyArray<string>
   sdk: Map<string, BundledSDK>
   modelLoaders: Record<string, CustomModelLoader>
   varsLoaders: Record<string, CustomVarsLoader>
@@ -1453,8 +1457,59 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
-        const catalog = mapValues(modelsDev, fromModelsDevProvider)
-        const database = mapValues(catalog, toPublicInfo)
+
+        // The models.dev snapshot holds every provider; a run only needs the ones it can
+        // reach. Converting a provider is expensive (thousands of models plus a JSON
+        // round trip for validation), so entries are built on first touch and memoized.
+        //
+        // Two graphs are kept, mirroring the original eager construction:
+        // - `catalog` is the raw conversion, used for model-name suggestions. Custom
+        //   loaders must never mutate it.
+        // - `database` is the validated copy that loaders and provider merging operate on.
+        const catalog: Record<string, Info> = {}
+        const database: Record<string, Info> = {}
+        const catalogFor = (providerID: ProviderV2.ID) => {
+          const existing = catalog[providerID]
+          if (existing) return existing
+          const source = modelsDev[providerID]
+          if (!source) return undefined
+          const next = fromModelsDevProvider(source)
+          catalog[providerID] = next
+          return next
+        }
+        const databaseFor = (providerID: ProviderV2.ID) => {
+          const existing = database[providerID]
+          if (existing) return existing
+          const source = catalogFor(providerID)
+          if (!source) return undefined
+          const next = toPublicInfo(source)
+          database[providerID] = next
+          return next
+        }
+
+        // Custom loaders almost never read `models`; handing them a shell keeps the
+        // conversion out of the startup path for providers that are never connected.
+        const shellFor = (providerID: ProviderV2.ID) => {
+          const existing = database[providerID]
+          if (existing) return existing
+          const source = modelsDev[providerID]
+          if (!source) return undefined
+          return Object.defineProperty(
+            {
+              id: providerID,
+              name: source.name,
+              env: [...(source.env ?? [])],
+              source: "custom",
+              options: {},
+            },
+            "models",
+            {
+              enumerable: true,
+              configurable: true,
+              get: () => databaseFor(providerID)?.models ?? {},
+            },
+          ) as Info
+        }
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1482,7 +1537,7 @@ const layer = Layer.effect(
             providers[providerID] = mergeDeep(existing, provider)
             return
           }
-          const match = database[providerID]
+          const match = databaseFor(providerID)
           if (!match) return
           // @ts-expect-error
           providers[providerID] = mergeDeep(match, provider)
@@ -1510,7 +1565,7 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
 
-          const provider = database[providerID]
+          const provider = databaseFor(providerID)
           if (!provider) continue
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
@@ -1531,7 +1586,7 @@ const layer = Layer.effect(
 
         // extend database from config
         for (const [providerID, provider] of configProviders) {
-          const existing = database[providerID]
+          const existing = databaseFor(ProviderV2.ID.make(providerID))
           const parsed: Info = {
             id: ProviderV2.ID.make(providerID),
             name: provider.name ?? existing?.name ?? providerID,
@@ -1631,15 +1686,19 @@ const layer = Layer.effect(
         }
 
         // load env
+        // Env names come from the raw snapshot so that scanning for credentials never
+        // converts a provider the run cannot use.
         const envs = yield* env.all()
-        for (const [id, provider] of Object.entries(database)) {
+        const configEnv = new Map(configProviders.map(([id, provider]) => [id, provider.env]))
+        for (const id of new Set([...Object.keys(modelsDev), ...configProviders.map(([id]) => id)])) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const apiKey = provider.env.map((item) => envs[item]).find(Boolean)
+          const names = configEnv.get(id) ?? modelsDev[id]?.env ?? []
+          const apiKey = names.map((item) => envs[item]).find(Boolean)
           if (!apiKey) continue
           mergeProvider(providerID, {
             source: "env",
-            key: provider.env.length === 1 ? apiKey : undefined,
+            key: names.length === 1 ? apiKey : undefined,
           })
         }
 
@@ -1669,7 +1728,7 @@ const layer = Layer.effect(
           const options = yield* Effect.promise(() =>
             plugin.auth!.loader!(
               () => bridge.promise(auth.get(providerID).pipe(Effect.orDie)) as any,
-              toPublicInfo(database[plugin.auth!.provider]),
+              toPublicInfo(databaseFor(providerID)!),
             ),
           )
           const opts = options ?? {}
@@ -1680,7 +1739,7 @@ const layer = Layer.effect(
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const data = database[providerID]
+          const data = shellFor(providerID)
           if (!data) {
             continue
           }
@@ -1772,7 +1831,10 @@ const layer = Layer.effect(
         return {
           models: languages,
           providers,
-          catalog,
+          catalog: catalogFor,
+          catalogKeys: () => [
+            ...new Set([...Object.keys(modelsDev), ...Object.keys(providers)]),
+          ],
           sdk,
           modelLoaders,
           varsLoaders,
@@ -1895,11 +1957,11 @@ const layer = Layer.effect(
       const s = yield* InstanceState.get(state)
       const provider = s.providers[providerID]
       if (!provider) {
-        const catalogProvider = s.catalog[providerID]
+        const catalogProvider = s.catalog(providerID)
         const suggestions = catalogProvider
           ? modelSuggestions(catalogProvider, modelID, runtimeFlags.enableExperimentalModels)
           : fuzzysort
-              .go(providerID, Object.keys({ ...s.catalog, ...s.providers }), { limit: 3, threshold: -10000 })
+              .go(providerID, s.catalogKeys(), { limit: 3, threshold: -10000 })
               .map((m) => m.target)
         return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
       }
@@ -1909,7 +1971,7 @@ const layer = Layer.effect(
         const current = modelSuggestions(provider, modelID, runtimeFlags.enableExperimentalModels)
         const suggestions = current.length
           ? current
-          : modelSuggestions(s.catalog[providerID], modelID, runtimeFlags.enableExperimentalModels)
+          : modelSuggestions(s.catalog(providerID), modelID, runtimeFlags.enableExperimentalModels)
         return yield* new ModelNotFoundError({ providerID, modelID, suggestions })
       }
       return info
