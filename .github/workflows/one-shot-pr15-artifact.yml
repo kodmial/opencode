@@ -1,0 +1,73 @@
+name: One-shot exact PR15 artifact
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  publish:
+    if: "${{ github.event.head_commit.message == 'ops: publish exact PR15 artifact' }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      SOURCE_SHA: 842157c38db9f8178ed0eee7af32f7536fe2346e
+      EXPECTED_SHA: d9f930c1e288fc81a4abb12f0dd3974584ab8d28d5587cfd6c979698fe45f0c0
+      EXPECTED_VERSION: "1.18.33"
+      EXPECTED_BYTES: "171218400"
+    steps:
+      - name: Install Bun exactly as qualification
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://bun.sh/install | bash
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.bun/bin:$PATH"
+          test "$(bun --version)" = "1.4.2"
+
+      - name: Build exact source head
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/opencode15 /tmp/pr15-artifact
+          mkdir -p /tmp/opencode15/src /tmp/pr15-artifact
+          curl -fsSL -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/kodmial/opencode/tarball/$SOURCE_SHA" \
+            -o /tmp/opencode15/pr15.tar.gz
+          tar -xzf /tmp/opencode15/pr15.tar.gz -C /tmp/opencode15/src
+          SRC="/tmp/opencode15/src/kodmial-opencode-842157c"
+          cd "$SRC"
+          bun install --frozen-lockfile
+          OPENCODE_VERSION="$EXPECTED_VERSION" bun run --cwd packages/opencode script/build.ts --coding --single
+          BIN="$SRC/packages/opencode/dist/opencode-linux-x64/bin/opencode"
+          ACTUAL_VERSION="$("$BIN" --version)"
+          ACTUAL_SHA="$(sha256sum "$BIN" | awk '{print $1}')"
+          ACTUAL_BYTES="$(stat -c %s "$BIN")"
+          echo "actual_version=$ACTUAL_VERSION"
+          echo "actual_sha=$ACTUAL_SHA"
+          echo "actual_bytes=$ACTUAL_BYTES"
+          test "$ACTUAL_VERSION" = "$EXPECTED_VERSION"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+          test "$ACTUAL_BYTES" = "$EXPECTED_BYTES"
+          cp "$BIN" /tmp/pr15-artifact/opencode-coding-linux-x64
+          printf '%s  %s\n' "$ACTUAL_SHA" "opencode-coding-linux-x64" > /tmp/pr15-artifact/opencode-coding-linux-x64.sha256
+          cat > /tmp/pr15-artifact/build-metadata.txt <<EOF
+          source_repo=kodmial/opencode
+          source_pr=15
+          source_sha=$SOURCE_SHA
+          version=$ACTUAL_VERSION
+          binary_sha256=$ACTUAL_SHA
+          binary_bytes=$ACTUAL_BYTES
+          build_command=OPENCODE_VERSION=1.18.33 bun run --cwd packages/opencode script/build.ts --coding --single
+          EOF
+
+      - name: Upload immutable artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: opencode-coding-linux-x64
+          path: /tmp/pr15-artifact/
+          if-no-files-found: error
+          retention-days: 30
