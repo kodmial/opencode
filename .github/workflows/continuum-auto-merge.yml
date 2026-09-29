@@ -25,5 +25,5 @@ jobs:
     with:
       review: false
       release: false
-      ci_workflow: continuum-ci.yml
+      ci_workflow: Continuum CI
       scheduler_workflow: continuum-scheduler.yml
