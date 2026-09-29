@@ -53,8 +53,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       local_e2e: ${{ steps.route.outputs.local_e2e }}
+      source_kind: ${{ steps.route.outputs.source_kind }}
       model: ${{ steps.route.outputs.model }}
       source_run: ${{ steps.route.outputs.source_run }}
+      release_tag: ${{ steps.route.outputs.release_tag }}
       artifact_id: ${{ steps.route.outputs.artifact_id }}
       source_sha: ${{ steps.route.outputs.source_sha }}
     steps:
@@ -72,21 +74,39 @@ jobs:
           [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || exit 0
 
           BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
-          grep -Fq '<!-- execution:anonymous-zen-e2e -->' <<<"$BODY" || exit 0
-
           MODEL="$(sed -n 's/^- model ID: `\([^`]*\)`.*/\1/p' <<<"$BODY" | head -1)"
-          SOURCE_RUN="$(sed -n 's/^- source workflow run: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
-          ARTIFACT_ID="$(sed -n 's/^- artifact ID: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
           SOURCE_SHA="$(sed -n 's/^- source SHA: `\([0-9a-f]*\)`.*/\1/p' <<<"$BODY" | head -1)"
 
-          [[ -n "$MODEL" && -n "$SOURCE_RUN" && -n "$ARTIFACT_ID" && -n "$SOURCE_SHA" ]] || {
-            echo "::error::anonymous Zen E2E marker is present but required metadata could not be parsed from the issue body"
-            exit 1
-          }
+          SOURCE_KIND=""
+          SOURCE_RUN=""
+          RELEASE_TAG=""
+          ARTIFACT_ID=""
+
+          if grep -Fq '<!-- execution:release-zen-e2e ' <<<"$BODY"; then
+            SOURCE_KIND="release"
+            RELEASE_TAG="$(sed -n 's/^- release tag: `\([^`]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+            ARTIFACT_ID="$(sed -n 's/^- release asset ID: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+            [[ -n "$MODEL" && -n "$RELEASE_TAG" && -n "$ARTIFACT_ID" && -n "$SOURCE_SHA" ]] || {
+              echo "::error::release Zen E2E metadata could not be parsed from issue body"
+              exit 1
+            }
+          elif grep -Fq '<!-- execution:anonymous-zen-e2e -->' <<<"$BODY"; then
+            SOURCE_KIND="actions"
+            SOURCE_RUN="$(sed -n 's/^- source workflow run: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+            ARTIFACT_ID="$(sed -n 's/^- artifact ID: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+            [[ -n "$MODEL" && -n "$SOURCE_RUN" && -n "$ARTIFACT_ID" && -n "$SOURCE_SHA" ]] || {
+              echo "::error::Actions Zen E2E metadata could not be parsed from issue body"
+              exit 1
+            }
+          else
+            exit 0
+          fi
 
           echo "local_e2e=true" >> "$GITHUB_OUTPUT"
+          echo "source_kind=$SOURCE_KIND" >> "$GITHUB_OUTPUT"
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
           echo "source_run=$SOURCE_RUN" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
           echo "artifact_id=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
 
@@ -167,8 +187,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       ISSUE_NUMBER: ${{ inputs.issue_number }}
       MODEL: ${{ needs.route.outputs.model }}
+      SOURCE_KIND: ${{ needs.route.outputs.source_kind }}
       SOURCE_SHA: ${{ needs.route.outputs.source_sha }}
       SOURCE_RUN: ${{ needs.route.outputs.source_run }}
+      RELEASE_TAG: ${{ needs.route.outputs.release_tag }}
       ARTIFACT_ID: ${{ needs.route.outputs.artifact_id }}
     steps:
       - name: Checkout validation harness
@@ -177,22 +199,30 @@ jobs:
           fetch-depth: 1
           ref: main
 
-      - name: Download exact PR artifact
-        id: download
-        continue-on-error: true
+      - name: Download exact Actions artifact
+        if: needs.route.outputs.source_kind == 'actions'
+        id: download_actions
         uses: actions/download-artifact@v4
         with:
           repository: ${{ github.repository }}
           run-id: ${{ needs.route.outputs.source_run }}
           artifact-ids: ${{ needs.route.outputs.artifact_id }}
           github-token: ${{ github.token }}
-          path: ${{ runner.temp }}/pr12-artifact
+          path: ${{ runner.temp }}/coding-artifact
+
+      - name: Download exact immutable release assets
+        if: needs.route.outputs.source_kind == 'release'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/coding-artifact"
+          gh release download "$RELEASE_TAG"             --repo "$GITHUB_REPOSITORY"             --pattern 'opencode-coding-linux-x64*'             --dir "$RUNNER_TEMP/coding-artifact"
 
       - name: Run anonymous Zen E2E
         id: e2e
         shell: bash
         env:
-          ARTIFACT_DIR: ${{ runner.temp }}/pr12-artifact
+          ARTIFACT_DIR: ${{ runner.temp }}/coding-artifact
         run: bash .github/scripts/run-anonymous-zen-e2e.sh
 
       - name: Upload structured E2E result
@@ -200,7 +230,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: opencode-pr12-zen-muse13-e2e
+          name: opencode-coding-zen-e2e-${{ needs.route.outputs.source_sha }}
           path: ${{ runner.temp }}/opencode-anonymous-zen-e2e/
           if-no-files-found: error
           retention-days: 30
@@ -245,13 +275,39 @@ jobs:
           TEST_EXIT_CODE: $(value TEST_EXIT_CODE)
           RUNTIME_INVARIANTS: $(value RUNTIME_INVARIANTS)
           ACTIONS_RUN: $(value ACTIONS_RUN)
-          RESULT_ARTIFACT: opencode-pr12-zen-muse13-e2e — ${ARTIFACT_URL:-artifact-id:${RESULT_ARTIFACT_ID:-unknown}}
+          RESULT_ARTIFACT: opencode-coding-zen-e2e-${SOURCE_SHA} — ${ARTIFACT_URL:-artifact-id:${RESULT_ARTIFACT_ID:-unknown}}
           NOTES: $(value NOTES)
           EOF
           gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$BODY"
+
+          # Validation is an experiment. PASS/PARTIAL/FAIL are all terminal
+          # outcomes for this exact immutable artifact; never burn retry budget
+          # by rerunning the same failed artifact until automation:paused.
           gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/automation:in-progress" >/dev/null 2>&1 || true
-          if [[ "$RESULT" == "PASS" ]]; then
-            gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --reason completed
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/automation:paused" >/dev/null 2>&1 || true
+          gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --reason completed
+
+          if [[ "$RESULT" != "PASS" ]]; then
+            # Return the evidence to the durable optimization owner instead of
+            # stopping the pruning loop on a validation task.
+            gh issue reopen 14 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            gh issue edit 14 --repo "$GITHUB_REPOSITORY" --add-label "priority:p0" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/14/labels/automation:paused" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/14/labels/automation:in-progress" >/dev/null 2>&1 || true
+
+            followup_marker="<!-- coding-validation-failure source_sha=$SOURCE_SHA -->"
+            exists="$(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/issues/14/comments"                 --jq --arg marker "$followup_marker" '[.[] | select((.body // "") | contains($marker))] | length'                 | awk '{s+=$1} END {print s+0}'
+            )"
+            if [[ "$exists" == "0" ]]; then
+              gh issue comment 14 --repo "$GITHUB_REPOSITORY" --body "$followup_marker
+Immutable coding artifact validation returned $RESULT for source $SOURCE_SHA.
+Validation issue: #$ISSUE_NUMBER
+Result workflow: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+Continue with the next evidence-based memory/coding-runtime optimization, publish a new immutable artifact, and requalify that new source. Do not retry this exact failed artifact."
+            fi
+            gh workflow run continuum-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
           fi
 
       - name: Fail workflow on failed validation
