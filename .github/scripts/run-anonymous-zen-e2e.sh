@@ -7,6 +7,7 @@ mkdir -p "$OUT"
 ISSUE_NUMBER="${ISSUE_NUMBER:?ISSUE_NUMBER is required}"
 MODEL="${MODEL:?MODEL is required}"
 SOURCE_SHA="${SOURCE_SHA:?SOURCE_SHA is required}"
+SOURCE_RUN="${SOURCE_RUN:?SOURCE_RUN is required}"
 ARTIFACT_ID="${ARTIFACT_ID:?ARTIFACT_ID is required}"
 ARTIFACT_DIR="${ARTIFACT_DIR:?ARTIFACT_DIR is required}"
 if [[ -d "$ARTIFACT_DIR/opencode-coding-linux-x64" ]]; then
@@ -60,10 +61,23 @@ if [[ -x "$BIN" && -f "$CHECKSUM" && -f "$METADATA" ]]; then
   expected_sha="$(awk '{print $1}' "$CHECKSUM" | head -1)"
   binary_sha="$(sha256sum "$BIN" | awk '{print $1}')"
   meta_sha="$(awk -F= '$1=="source_sha" {print $2}' "$METADATA" | tail -1)"
-  if [[ -n "$expected_sha" && "$binary_sha" == "$expected_sha" && "$meta_sha" == "$SOURCE_SHA" ]]; then
+  run_head="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq '.head_sha // ""' 2>/dev/null || true)"
+  metadata_matches=false
+  if [[ "$meta_sha" == "$SOURCE_SHA" ]]; then
+    metadata_matches=true
+  elif [[ "$meta_sha" =~ ^[0-9a-f]{40}$ ]]; then
+    # pull_request workflows normally check out GitHub's synthetic test-merge
+    # commit. Accept that checkout only when the exact PR head recorded for the
+    # source run is one of its parents.
+    if gh api "repos/$GITHUB_REPOSITORY/commits/$meta_sha" --jq '.parents[].sha' 2>/dev/null | grep -Fxq "$SOURCE_SHA"; then
+      metadata_matches=true
+    fi
+  fi
+
+  if [[ -n "$expected_sha" && "$binary_sha" == "$expected_sha" && "$run_head" == "$SOURCE_SHA" && "$metadata_matches" == true ]]; then
     artifact_ok=true
   else
-    append_note "artifact identity mismatch: expected source=$SOURCE_SHA metadata=${meta_sha:-missing} bundled_sha=${expected_sha:-missing} actual_sha=${binary_sha:-missing}"
+    append_note "artifact identity mismatch: expected head=$SOURCE_SHA run_head=${run_head:-missing} metadata=${meta_sha:-missing} bundled_sha=${expected_sha:-missing} actual_sha=${binary_sha:-missing}"
   fi
 else
   append_note "artifact files missing or binary not executable"
