@@ -2,8 +2,10 @@ name: Continuum scheduler
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
   issues:
-    types: [opened, reopened]
+    types: [opened, reopened, closed, labeled, unlabeled]
   schedule:
     - cron: "*/5 * * * *"
 
@@ -23,5 +25,5 @@ jobs:
     with:
       opencode_workflow: continuum-opencode.yml
       wip_limit: 4
-      lease_minutes: 45
-      max_attempts: 2
+      lease_minutes: 210
+      max_attempts: 4
