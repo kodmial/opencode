@@ -168,6 +168,7 @@ jobs:
       ISSUE_NUMBER: ${{ inputs.issue_number }}
       MODEL: ${{ needs.route.outputs.model }}
       SOURCE_SHA: ${{ needs.route.outputs.source_sha }}
+      SOURCE_RUN: ${{ needs.route.outputs.source_run }}
       ARTIFACT_ID: ${{ needs.route.outputs.artifact_id }}
     steps:
       - name: Checkout validation harness
