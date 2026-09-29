@@ -41,6 +41,8 @@ jobs:
       bun_version: "1.3.14"
       prerelease: true
       expected_version: "1.18.33"
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.TAP_PAT }}
 
   validate:
     needs: release
