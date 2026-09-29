@@ -10,6 +10,7 @@ import { ShareNext } from "@/share/share-next"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
 import { Service } from "./bootstrap-service"
+import { Flag } from "@opencode-ai/core/flag/flag"
 
 export { Service } from "./bootstrap-service"
 export type { Interface } from "./bootstrap-service"
@@ -34,6 +35,17 @@ const layer = Layer.effect(
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
       yield* config.get()
+      if (Flag.OPENCODE_CODING_ONLY) {
+        // Keep one-shot coding startup lean. These services are either disabled
+        // by the coding profile or only needed by interactive/IDE workflows.
+        yield* Effect.forEach(
+          [vcs, project],
+          (s) => s.init().pipe(Effect.catchCause((cause) => Effect.logWarning("init failed", { cause }))),
+          { concurrency: "unbounded", discard: true },
+        ).pipe(Effect.withSpan("InstanceBootstrap.init.coding"))
+        return
+      }
+
       // Plugin can mutate config so it has to be initialized before anything else.
       yield* plugin.init()
       // Each service self-manages its own slow work via Effect.forkScoped against

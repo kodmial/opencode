@@ -12,6 +12,7 @@
     "bench:test": "bun run script/bench-test-suite.ts",
     "profile:test": "bun run script/profile-test-files.ts",
     "build": "bun run script/build.ts",
+    "build:coding": "bun run script/build.ts --single --coding --skip-install",
     "dev": "bun run ./src/index.ts",
     "dev:temporary": "bun run ./src/temporary.ts"
   },

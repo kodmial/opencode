@@ -1,4 +1,4 @@
-name: Continuum CI
+name: OpenCode Coding Artifact
 
 on:
   pull_request:
@@ -9,15 +9,18 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
-  group: continuum-ci-${{ github.event.pull_request.number || github.ref }}
+  group: opencode-coding-artifact-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      EXPECTED_OPENCODE_VERSION: "1.18.33"
 
     steps:
       - name: Checkout
@@ -31,8 +34,20 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Validate source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION="$(jq -r '.version' packages/opencode/package.json)"
+          if [[ "$PACKAGE_VERSION" != "$EXPECTED_OPENCODE_VERSION" ]]; then
+            echo "::error::Source package version '$PACKAGE_VERSION' does not match expected base version '$EXPECTED_OPENCODE_VERSION'"
+            exit 1
+          fi
+
       - name: Build coding runner
-        run: bun run --cwd packages/opencode build --single --skip-embed-web-ui --skip-install
+        env:
+          OPENCODE_VERSION: ${{ env.EXPECTED_OPENCODE_VERSION }}
+        run: bun run --cwd packages/opencode build:coding
 
       - name: Verify coding runner
         shell: bash
@@ -40,7 +55,12 @@ jobs:
           set -euo pipefail
           BIN=packages/opencode/dist/opencode-linux-x64/bin/opencode
           test -x "$BIN"
-          "$BIN" --version
+          ACTUAL_VERSION="$("$BIN" --version | tr -d '\r\n')"
+          if [[ "$ACTUAL_VERSION" != "$EXPECTED_OPENCODE_VERSION" ]]; then
+            echo "::error::Built binary version '$ACTUAL_VERSION' does not exactly match expected '$EXPECTED_OPENCODE_VERSION'"
+            exit 1
+          fi
+          echo "Verified OpenCode version: $ACTUAL_VERSION"
           HELP="$($BIN --help 2>&1)"
           grep -q "opencode run" <<<"$HELP"
           if grep -Eq "(^|[[:space:]])(web|serve|attach|upgrade|uninstall)([[:space:]]|$)" <<<"$HELP"; then
@@ -48,3 +68,69 @@ jobs:
             exit 1
           fi
           ls -lh "$BIN"
+
+      - name: Package coding artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN=packages/opencode/dist/opencode-linux-x64/bin/opencode
+          OUT="$RUNNER_TEMP/opencode-coding-artifact"
+          mkdir -p "$OUT"
+          install -m 0755 "$BIN" "$OUT/opencode-coding-linux-x64"
+          (
+            cd "$OUT"
+            sha256sum opencode-coding-linux-x64 > opencode-coding-linux-x64.sha256
+          )
+          {
+            echo "source_repository=$GITHUB_REPOSITORY"
+            echo "source_sha=$GITHUB_SHA"
+            echo "source_ref=$GITHUB_REF"
+            echo "build_target=linux-x64-glibc"
+            echo "build_command=OPENCODE_VERSION=$EXPECTED_OPENCODE_VERSION bun run --cwd packages/opencode build:coding"
+            echo "opencode_version=$EXPECTED_OPENCODE_VERSION"
+          } > "$OUT/build-metadata.txt"
+          ls -lh "$OUT"
+
+      - name: Upload coding artifact
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: opencode-coding-linux-x64
+          path: ${{ runner.temp }}/opencode-coding-artifact/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+
+      - name: Publish immutable artifact manifest
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/opencode-coding-artifact"
+          BINARY_SHA="$(awk '{print $1}' "$OUT/opencode-coding-linux-x64.sha256")"
+          BUILT_SOURCE_SHA="$(awk -F= '$1=="source_sha"{print $2}' "$OUT/build-metadata.txt")"
+          VERSION="$(awk -F= '$1=="opencode_version"{print $2}' "$OUT/build-metadata.txt")"
+          [[ "$BINARY_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BUILT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ -n "$ARTIFACT_ID" && -n "$ARTIFACT_DIGEST" && -n "$VERSION" ]]
+
+          MANIFEST="$(jq -nc \
+            --arg schema "opencode-coding-artifact-manifest/v1" \
+            --arg head_sha "$PR_HEAD_SHA" \
+            --arg built_source_sha "$BUILT_SOURCE_SHA" \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg artifact_id "$ARTIFACT_ID" \
+            --arg artifact_name "opencode-coding-linux-x64" \
+            --arg archive_digest "$ARTIFACT_DIGEST" \
+            --arg binary_sha256 "$BINARY_SHA" \
+            --arg version "$VERSION" \
+            '{schema:$schema,head_sha:$head_sha,built_source_sha:$built_source_sha,workflow_run_id:($run_id|tonumber),artifact_id:($artifact_id|tonumber),artifact_name:$artifact_name,archive_digest:$archive_digest,binary_sha256:$binary_sha256,version:$version}')"
+
+          gh issue comment 11 --repo "$GITHUB_REPOSITORY" --body "$(printf '%s\n%s' '<!-- opencode-coding-artifact-manifest -->' "$MANIFEST")"
