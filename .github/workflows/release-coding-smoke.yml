@@ -29,20 +29,88 @@ concurrency:
 jobs:
   release:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    uses: kodmial/continuum/.github/workflows/release-bun-binary.yml@main
-    with:
-      source_sha: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
-      package_dir: packages/opencode
-      build_argv_json: '["bun","run","--cwd","packages/opencode","script/build.ts","--single","--coding","--skip-install","--skip-embed-web-ui"]'
-      build_env_json: '{"OPENCODE_VERSION":"1.18.33"}'
-      binary_path: packages/opencode/dist/opencode-linux-x64/bin/opencode
-      asset_name: opencode-coding-linux-x64
-      tag_prefix: coding-smoke-v
-      bun_version: "1.3.14"
-      prerelease: true
-      expected_version: "1.18.33"
-    secrets:
-      RELEASE_TOKEN: ${{ secrets.TAP_PAT }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      VERSION: "1.18.33"
+    steps:
+      - name: Validate source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "::error::invalid source SHA: $SOURCE_SHA"
+            exit 1
+          }
+
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build coding-only binary
+        env:
+          OPENCODE_VERSION: ${{ env.VERSION }}
+        run: bun run --cwd packages/opencode script/build.ts --single --coding --skip-install --skip-embed-web-ui
+
+      - name: Package immutable release evidence
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          BIN="packages/opencode/dist/opencode-linux-x64/bin/opencode"
+          test -x "$BIN"
+          test "$("$BIN" --version | tr -d '\r')" = "$VERSION"
+
+          OUT="$RUNNER_TEMP/coding-release"
+          mkdir -p "$OUT"
+          cp "$BIN" "$OUT/opencode-coding-linux-x64"
+          SHA="$(sha256sum "$OUT/opencode-coding-linux-x64" | awk '{print $1}')"
+          printf '%s  %s\n' "$SHA" opencode-coding-linux-x64 > "$OUT/opencode-coding-linux-x64.sha256"
+          jq -n --arg source_sha "$SOURCE_SHA" --arg binary_sha256 "$SHA" --arg version "$VERSION" --arg run_id "$GITHUB_RUN_ID" \
+            '{source_sha:$source_sha,binary_sha256:$binary_sha256,version:$version,workflow_run_id:$run_id}' \
+            > "$OUT/opencode-coding-linux-x64.json"
+
+          TAG="coding-smoke-v${VERSION}-${SOURCE_SHA:0:12}"
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Publish or refresh immutable prerelease
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.TAP_PAT }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/coding-release"
+          if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" >/tmp/release.json 2>/dev/null; then
+            TARGET="$(jq -r '.target_commitish // ""' /tmp/release.json)"
+            [[ "$TARGET" == "$SOURCE_SHA" ]] || {
+              echo "::error::existing release $RELEASE_TAG points to $TARGET, expected $SOURCE_SHA"
+              exit 1
+            }
+            gh release upload "$RELEASE_TAG" "$OUT/opencode-coding-linux-x64" "$OUT/opencode-coding-linux-x64.sha256" "$OUT/opencode-coding-linux-x64.json" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$OUT/opencode-coding-linux-x64" "$OUT/opencode-coding-linux-x64.sha256" "$OUT/opencode-coding-linux-x64.json" --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" --title "Coding smoke $VERSION ${SOURCE_SHA:0:12}" --prerelease --notes "Immutable coding-only smoke artifact for source $SOURCE_SHA."
+          fi
+
+          ASSET_ID="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.assets[] | select(.name == "opencode-coding-linux-x64") | .id' | head -1)"
+          [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::published release has no binary asset"
+            exit 1
+          }
+          echo "asset_id=$ASSET_ID" >> "$GITHUB_OUTPUT"
 
   validate:
     needs: release
