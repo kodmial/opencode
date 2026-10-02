@@ -157,7 +157,7 @@ jobs:
             gh issue edit 14 --repo "$GITHUB_REPOSITORY" --add-label "priority:p0" >/dev/null 2>&1 || true
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/14/labels/automation:paused" >/dev/null 2>&1 || true
             gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/14/labels/automation:in-progress" >/dev/null 2>&1 || true
-            gh workflow run continuum-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
+            gh workflow run continuum-issue-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
           fi
 
       - name: Mark validation failure without blocking the next optimization
