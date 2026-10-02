@@ -6,6 +6,8 @@ on:
     paths:
       - '.github/workflows/work-lock-15-enable-schedules.yml'
 
+# Work Lock 15: re-enable after temporary cron offset.
+
 permissions:
   actions: write
   contents: read
