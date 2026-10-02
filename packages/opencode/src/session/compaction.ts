@@ -12,6 +12,7 @@ import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
 import { Truncate } from "@/tool/truncate"
+import { Database } from "@opencode-ai/core/database/database"
 
 import { Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
@@ -230,6 +231,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const truncate = yield* Truncate.Service
+    const database = yield* Database.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -304,33 +306,50 @@ const layer = Layer.effect(
       if (!cfg.compaction?.prune && !flags.lowMemory) return
       yield* Effect.logInfo("pruning")
 
-      const msgs = yield* session
-        .messages({ sessionID: input.sessionID })
-        .pipe(Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)))
-      if (!msgs) return
-
+      // Walk newest-first one page at a time so a long transcript never has to
+      // sit fully hydrated in the heap just to discover that only its old tail
+      // is prunable. Only the candidate pages plus the small toPrune list are
+      // retained; everything newer than the protect budget is dropped.
       let total = 0
       let pruned = 0
       const toPrune: SessionV1.ToolPart[] = []
       let turns = 0
+      let before: string | undefined
+      let stopped = false
 
-      loop: for (let msgIndex = msgs.length - 1; msgIndex >= 0; msgIndex--) {
-        const msg = msgs[msgIndex]
-        if (msg.info.role === "user") turns++
-        if (turns < 2) continue
-        if (msg.info.role === "assistant" && msg.info.summary) break loop
-        for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
-          const part = msg.parts[partIndex]
-          if (part.type !== "tool") continue
-          if (part.state.status !== "completed") continue
-          if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
-          if (part.state.time.compacted) break loop
-          const estimate = Token.estimate(part.state.output)
-          total += estimate
-          if (total <= PRUNE_PROTECT) continue
-          pruned += estimate
-          toPrune.push(part)
+      outer: while (!stopped) {
+        const page = yield* MessageV2.page({ sessionID: input.sessionID, limit: 50, before }).pipe(
+          Effect.provideService(Database.Service, database),
+          Effect.catchIf(NotFoundError.isInstance, () => Effect.succeed(undefined)),
+        )
+        if (!page || page.items.length === 0) break
+        for (let msgIndex = page.items.length - 1; msgIndex >= 0; msgIndex--) {
+          const msg = page.items[msgIndex]!
+          if (msg.info.role === "user") turns++
+          if (turns < 2) continue
+          if (msg.info.role === "assistant" && msg.info.summary) {
+            stopped = true
+            break
+          }
+          for (let partIndex = msg.parts.length - 1; partIndex >= 0; partIndex--) {
+            const part = msg.parts[partIndex]!
+            if (part.type !== "tool") continue
+            if (part.state.status !== "completed") continue
+            if (PRUNE_PROTECTED_TOOLS.includes(part.tool)) continue
+            if (part.state.time.compacted) {
+              stopped = true
+              break
+            }
+            const estimate = Token.estimate(part.state.output)
+            total += estimate
+            if (total <= PRUNE_PROTECT) continue
+            pruned += estimate
+            toPrune.push(part)
+          }
+          if (stopped) break
         }
+        if (stopped || !page.more || !page.cursor) break outer
+        before = page.cursor
       }
 
       yield* Effect.logInfo("found", { pruned, total })
@@ -419,7 +438,14 @@ const layer = Layer.effect(
       const transformable = hooks.some((hook) => hook["experimental.chat.messages.transform"])
       const msgs = transformable ? structuredClone(selected.head) : selected.head
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-      const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+      // Build the summary text incrementally: msgs.map().join() briefly holds
+      // both the per-message array and the joined copy at peak.
+      let conversation = ""
+      for (const item of msgs) {
+        const text = serialize(item)
+        if (!text) continue
+        conversation = conversation ? `${conversation}\n\n${text}` : text
+      }
       const nextPrompt =
         compacting.prompt ??
         [
@@ -645,6 +671,7 @@ export const node = LayerNode.make({
     Truncate.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    Database.node,
   ],
 })
 

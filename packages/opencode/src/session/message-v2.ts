@@ -49,7 +49,21 @@ export const SYNTHETIC_ATTACHMENT_PROMPT = "Attached media from tool result:"
 // tool-output directory. Shared by model replay and compaction serialization so
 // a pruned part renders identically everywhere.
 export const COMPACTED_OUTPUT = "[Old tool result content cleared]"
+// Disk-first coding replay keeps only a bounded inline preview per tool result:
+// the full payload lives under Global.Path.data/tool-output and is referenced
+// via metadata.outputPath. 12 KiB sits inside the 8-16 KiB issue target and
+// matches Truncate.LOW_MEMORY_MAX_BYTES so model replay and tool storage agree.
+export const LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS = 12 * 1024
 export { isMedia }
+
+function defaultToolOutputMaxChars(override?: number) {
+  if (override !== undefined) return override
+  if (process.env.OPENCODE_LOW_MEMORY === "0") return undefined
+  if (process.env.OPENCODE_LOW_MEMORY === "1" || process.env.OPENCODE_LOW_MEMORY === "true")
+    return LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS
+  if (process.env.AGENT === "1") return LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS
+  return undefined
+}
 
 function truncateToolOutput(text: string, maxChars?: number) {
   if (!maxChars || text.length <= maxChars) return text
@@ -140,6 +154,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
 ) {
   const result: UIMessage[] = []
   const toolNames = new Set<string>()
+  const toolOutputMaxChars = defaultToolOutputMaxChars(options?.toolOutputMaxChars)
   // Track media from tool results that need to be injected as user messages
   // for providers that don't support that media type in tool results.
   //
@@ -301,7 +316,7 @@ export const toModelMessagesEffect = Effect.fnUntraced(function* (
           if (part.state.status === "completed") {
             const outputText = part.state.time.compacted
               ? COMPACTED_OUTPUT
-              : truncateToolOutput(part.state.output, options?.toolOutputMaxChars)
+              : truncateToolOutput(part.state.output, toolOutputMaxChars)
             const attachments = part.state.time.compacted || options?.stripMedia ? [] : (part.state.attachments ?? [])
 
             // For providers that don't support media in tool results, extract media files
