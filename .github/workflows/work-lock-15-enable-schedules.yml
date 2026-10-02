@@ -1,0 +1,24 @@
+name: Work Lock 15 enable scheduled callers
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/work-lock-15-enable-schedules.yml'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  enable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ensure scheduled workflows are enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-issue-scheduler.yml/enable"
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-auto-merge.yml/enable"
