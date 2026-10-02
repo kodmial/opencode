@@ -361,8 +361,9 @@ const layer = Layer.effect(
             // future hydration of this transcript, which is where the retained
             // heap actually goes. Persist the full text to the tool-output
             // directory once, then keep only a placeholder inline.
-            if (part.state.metadata.outputPath === undefined) {
-              part.state.metadata.outputPath = yield* truncate.write(part.state.output)
+            const metadata = (part.state.metadata ??= {}) as Record<string, unknown>
+            if (metadata.outputPath === undefined) {
+              metadata.outputPath = yield* truncate.write(part.state.output)
             }
             part.state.output = MessageV2.COMPACTED_OUTPUT
             yield* session.updatePart(part)
