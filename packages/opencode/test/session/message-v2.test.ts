@@ -821,6 +821,107 @@ describe("session.message-v2.toModelMessage", () => {
     ])
   })
 
+  test("low-memory replay bound stays inside the 8-16 KiB issue target", () => {
+    expect(MessageV2.LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS).toBeGreaterThanOrEqual(8 * 1024)
+    expect(MessageV2.LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS).toBeLessThanOrEqual(16 * 1024)
+  })
+
+  test("headless coding runs bound tool output for model replay without an explicit option", async () => {
+    const previousAgent = process.env.AGENT
+    const previousLowMemory = process.env.OPENCODE_LOW_MEMORY
+    process.env.AGENT = "1"
+    delete process.env.OPENCODE_LOW_MEMORY
+    try {
+      const userID = "m-user"
+      const assistantID = "m-assistant"
+      const output = "x".repeat(MessageV2.LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS + 100)
+      const input: SessionV1.WithParts[] = [
+        {
+          info: userInfo(userID),
+          parts: [{ ...basePart(userID, "u1"), type: "text", text: "run tool" }] as SessionV1.Part[],
+        },
+        {
+          info: assistantInfo(assistantID, userID),
+          parts: [
+            {
+              ...basePart(assistantID, "a1"),
+              type: "tool",
+              callID: "call-1",
+              tool: "bash",
+              state: {
+                status: "completed",
+                input: { cmd: "ls" },
+                output,
+                title: "Shell",
+                metadata: {},
+                time: { start: 0, end: 1 },
+              },
+            },
+          ] as SessionV1.Part[],
+        },
+      ]
+      const messages = await MessageV2.toModelMessages(input, model)
+      const toolResult = messages.at(-1)?.content[0]
+      expect(toolResult?.type).toBe("tool-result")
+      if (toolResult?.type !== "tool-result" || typeof toolResult.output !== "object") throw new Error("expected tool result")
+      const value = (toolResult.output as { type: string; value: string }).value
+      expect(value).toContain("[Tool output truncated for compaction:")
+      expect(value.length).toBeLessThan(output.length)
+    } finally {
+      if (previousAgent === undefined) delete process.env.AGENT
+      else process.env.AGENT = previousAgent
+      if (previousLowMemory === undefined) delete process.env.OPENCODE_LOW_MEMORY
+      else process.env.OPENCODE_LOW_MEMORY = previousLowMemory
+    }
+  })
+
+  test("OPENCODE_LOW_MEMORY=0 restores unbounded replay for interactive runs", async () => {
+    const previousAgent = process.env.AGENT
+    const previousLowMemory = process.env.OPENCODE_LOW_MEMORY
+    process.env.AGENT = "1"
+    process.env.OPENCODE_LOW_MEMORY = "0"
+    try {
+      const userID = "m-user"
+      const assistantID = "m-assistant"
+      const output = "x".repeat(MessageV2.LOW_MEMORY_TOOL_OUTPUT_MAX_CHARS + 100)
+      const input: SessionV1.WithParts[] = [
+        {
+          info: userInfo(userID),
+          parts: [{ ...basePart(userID, "u1"), type: "text", text: "run tool" }] as SessionV1.Part[],
+        },
+        {
+          info: assistantInfo(assistantID, userID),
+          parts: [
+            {
+              ...basePart(assistantID, "a1"),
+              type: "tool",
+              callID: "call-1",
+              tool: "bash",
+              state: {
+                status: "completed",
+                input: { cmd: "ls" },
+                output,
+                title: "Shell",
+                metadata: {},
+                time: { start: 0, end: 1 },
+              },
+            },
+          ] as SessionV1.Part[],
+        },
+      ]
+      const messages = await MessageV2.toModelMessages(input, model)
+      const toolResult = messages.at(-1)?.content[0]
+      expect(toolResult?.type).toBe("tool-result")
+      if (toolResult?.type !== "tool-result" || typeof toolResult.output !== "object") throw new Error("expected tool result")
+      expect((toolResult.output as { type: string; value: string }).value).toBe(output)
+    } finally {
+      if (previousAgent === undefined) delete process.env.AGENT
+      else process.env.AGENT = previousAgent
+      if (previousLowMemory === undefined) delete process.env.OPENCODE_LOW_MEMORY
+      else process.env.OPENCODE_LOW_MEMORY = previousLowMemory
+    }
+  })
+
   test("converts assistant tool error into error-text tool result", async () => {
     const userID = "m-user"
     const assistantID = "m-assistant"
