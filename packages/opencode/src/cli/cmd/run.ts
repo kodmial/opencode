@@ -877,6 +877,11 @@ export const RunCommand = effectCmd({
           return
         }
 
+        // Fold this branch out of coding builds before resolving mini/OpenTUI.
+        if (process.env.OPENCODE_CODING_ONLY === "1") {
+          return die("Interactive mini mode is not available in the coding build")
+        }
+
         const model = pick(args.model)
         const { runInteractiveMode } = await import("./run/runtime")
         try {
@@ -904,7 +909,7 @@ export const RunCommand = effectCmd({
         return
       }
 
-      if (interactive && !args.attach && !args.session && !args.continue) {
+      if (process.env.OPENCODE_CODING_ONLY !== "1" && interactive && !args.attach && !args.session && !args.continue) {
         const model = pick(args.model)
         const { runInteractiveLocalMode } = await import("./run/runtime")
         const fetchFn = (async (input: RequestInfo | URL, init?: RequestInit) => {

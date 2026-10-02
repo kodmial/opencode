@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: opencode-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  call:
+    uses: kodmial/continuum/.github/workflows/continuum-validation.yml@main
+    secrets: inherit
+    with:
+      continuum_ref: main
+      runner: ubuntu-latest
+      auto_detect: 'false'
+      bun_version: '1.3.14'
+      validation_command: bash automation/continuum-ci.sh
+      publish_status: 'false'
+      dispatch_repair: 'false'

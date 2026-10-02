@@ -2,19 +2,36 @@ name: OpenCode coding release smoke
 
 on:
   workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact OpenCode source SHA to build; defaults to the triggering commit"
+        required: false
+        type: string
+  pull_request:
+    branches: [main]
+    paths:
+      - "packages/opencode/**"
   push:
     branches: [main]
     paths:
+      - "packages/opencode/**"
       - ".github/workflows/release-coding-smoke.yml"
 
 permissions:
+  actions: write
   contents: write
+  issues: write
+
+concurrency:
+  group: coding-release-${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: false
 
 jobs:
   release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: kodmial/continuum/.github/workflows/release-bun-binary.yml@main
     with:
-      source_sha: 842157c38db9f8178ed0eee7af32f7536fe2346e
+      source_sha: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
       package_dir: packages/opencode
       build_argv_json: '["bun","run","--cwd","packages/opencode","script/build.ts","--single","--coding","--skip-install","--skip-embed-web-ui"]'
       build_env_json: '{"OPENCODE_VERSION":"1.18.33"}'
@@ -24,3 +41,130 @@ jobs:
       bun_version: "1.3.14"
       prerelease: true
       expected_version: "1.18.33"
+    secrets:
+      RELEASE_TOKEN: ${{ secrets.TAP_PAT }}
+
+  validate:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: write
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
+      SOURCE_KIND: release
+      MODEL: opencode/muse-spark-1.3-contributor-free
+      VERSION: "1.18.33"
+      ISSUE_NUMBER: "14"
+    steps:
+      - name: Checkout current validation harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Download exact immutable release assets
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || {
+            echo "::error::invalid source SHA: $SOURCE_SHA"
+            exit 1
+          }
+
+          SHORT_SHA="${SOURCE_SHA:0:12}"
+          TAG="coding-smoke-v${VERSION}-${SHORT_SHA}"
+          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")"
+          ASSET_ID="$(jq -r '.assets[] | select(.name == "opencode-coding-linux-x64") | .id' <<<"$RELEASE_JSON" | head -1)"
+          [[ "$ASSET_ID" =~ ^[0-9]+$ ]] || {
+            echo "::error::release $TAG does not contain opencode-coding-linux-x64"
+            exit 1
+          }
+
+          mkdir -p "$RUNNER_TEMP/coding-artifact"
+          gh release download "$TAG"             --repo "$GITHUB_REPOSITORY"             --pattern 'opencode-coding-linux-x64*'             --dir "$RUNNER_TEMP/coding-artifact"
+
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "asset_id=$ASSET_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Run real anonymous Zen coding validation
+        id: e2e
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+          ARTIFACT_ID: ${{ steps.release_meta.outputs.asset_id }}
+          ARTIFACT_DIR: ${{ runner.temp }}/coding-artifact
+        run: bash .github/scripts/run-anonymous-zen-e2e.sh
+
+      - name: Upload structured validation result
+        id: result_artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-coding-zen-e2e-${{ env.SOURCE_SHA }}
+          path: ${{ runner.temp }}/opencode-anonymous-zen-e2e/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Feed result back into the optimization loop
+        if: always()
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.release_meta.outputs.release_tag }}
+          ARTIFACT_ID: ${{ steps.release_meta.outputs.asset_id }}
+          RESULT_ARTIFACT_URL: ${{ steps.result_artifact.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+          JSON="$RUNNER_TEMP/opencode-anonymous-zen-e2e/result.json"
+          if [[ ! -f "$JSON" ]]; then
+            mkdir -p "$(dirname "$JSON")"
+            jq -n               --arg SOURCE_SHA "$SOURCE_SHA"               --arg ARTIFACT_ID "${ARTIFACT_ID:-unknown}"               --arg MODEL "$MODEL"               --arg RUN_URL "https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"               '{RESULT:"FAIL",ARTIFACT_ID:$ARTIFACT_ID,SOURCE_SHA:$SOURCE_SHA,BINARY_SHA256:"",MODEL:$MODEL,AUTH_MODE:"anonymous/no API key",MINIMAL_REQUEST:"fail",MINIMAL_EXIT_CODE:"not-run",MINIMAL_RESPONSE:"validation harness failed before producing result.json",CODING_LOOP:"fail",TOOLS_OBSERVED:"none",FILE_EDIT_CONFIRMED:"no",TEST_COMMAND:"python3 test_calc.py",TEST_EXIT_CODE:"not-run",RUNTIME_INVARIANTS:"fail",ACTIONS_RUN:$RUN_URL,NOTES:"validation harness failure"}'               > "$JSON"
+          fi
+
+          RESULT="$(jq -r '.RESULT // "FAIL"' "$JSON")"
+          marker="<!-- coding-release-validation source_sha=$SOURCE_SHA -->"
+          body="$RUNNER_TEMP/optimization-result.md"
+          cat > "$body" <<EOF
+          $marker
+          Immutable coding release validation: **$RESULT**
+
+          - source SHA: `$SOURCE_SHA`
+          - release tag: `${RELEASE_TAG:-unknown}`
+          - release asset ID: `${ARTIFACT_ID:-unknown}`
+          - binary SHA-256: `$(jq -r '.BINARY_SHA256 // ""' "$JSON")`
+          - minimal request: `$(jq -r '.MINIMAL_REQUEST // ""' "$JSON")`
+          - coding loop: `$(jq -r '.CODING_LOOP // ""' "$JSON")`
+          - runtime invariants: `$(jq -r '.RUNTIME_INVARIANTS // ""' "$JSON")`
+          - workflow: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          - detailed result artifact: ${RESULT_ARTIFACT_URL:-not available}
+
+          This exact immutable artifact is terminal. Do not retry it automatically.
+          EOF
+
+          existing="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/14/comments"               --jq ".[] | select((.body // \"\") | contains(\"$marker\")) | .id"               2>/dev/null | head -1 || true
+          )"
+          if [[ -z "$existing" ]]; then
+            gh issue comment 14 --repo "$GITHUB_REPOSITORY" --body-file "$body"
+          fi
+
+          if [[ "$RESULT" != "PASS" ]]; then
+            gh issue reopen 14 --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+            gh issue edit 14 --repo "$GITHUB_REPOSITORY" --add-label "priority:p0" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/14/labels/automation:paused" >/dev/null 2>&1 || true
+            gh api --method DELETE "repos/$GITHUB_REPOSITORY/issues/14/labels/automation:in-progress" >/dev/null 2>&1 || true
+            gh workflow run continuum-scheduler.yml --repo "$GITHUB_REPOSITORY" --ref main
+          fi
+
+      - name: Mark validation failure without blocking the next optimization
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          JSON="$RUNNER_TEMP/opencode-anonymous-zen-e2e/result.json"
+          [[ -f "$JSON" ]] || exit 1
+          [[ "$(jq -r '.RESULT' "$JSON")" == "PASS" ]]

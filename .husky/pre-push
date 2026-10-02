@@ -9,6 +9,14 @@ if [ "$CI" = "true" ] || [ "$CI" = "1" ]; then
   exit 0
 fi
 
+# Never block a push just because the toolchain is unavailable. Automation
+# pushes from runners that intentionally skip installing Bun, and a hook is not
+# a place to fail a push over a missing dev dependency.
+if ! command -v bun >/dev/null 2>&1; then
+  echo "pre-push: bun not found, skipping version check and typecheck"
+  exit 0
+fi
+
 # Check if bun version matches package.json
 # keep in sync with packages/script/src/index.ts semver qualifier
 bun -e '

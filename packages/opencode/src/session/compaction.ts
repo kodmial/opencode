@@ -11,6 +11,7 @@ import { Agent } from "@/agent/agent"
 import { Plugin } from "@/plugin"
 import { Config } from "@/config/config"
 import { NotFoundError } from "@/storage/storage"
+import { Truncate } from "@/tool/truncate"
 
 import { Effect, Layer, Context } from "effect"
 import { InstanceState } from "@/effect/instance-state"
@@ -48,7 +49,7 @@ type CompletedCompaction = {
   summary: string | undefined
 }
 
-const truncate = (value: string) =>
+const clipToolOutput = (value: string) =>
   value.length <= TOOL_OUTPUT_MAX_CHARS ? value : `${value.slice(0, TOOL_OUTPUT_MAX_CHARS)}\n[truncated]`
 
 const serialize = (message: SessionV1.WithParts) => {
@@ -74,8 +75,8 @@ const serialize = (message: SessionV1.WithParts) => {
           (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
         )
         const output = part.state.time.compacted
-          ? "[Old tool result content cleared]"
-          : truncate([part.state.output, ...attachments].join("\n"))
+          ? MessageV2.COMPACTED_OUTPUT
+          : clipToolOutput([part.state.output, ...attachments].join("\n"))
         return [call, `[Tool result]: ${output}`]
       }
       if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
@@ -112,6 +113,41 @@ function completedCompactions(messages: SessionV1.WithParts[]) {
   })
 }
 
+// Per-part overhead standing in for the provider wire framing (role, tool
+// envelope, ids) that the previous model-message round trip used to include.
+// Deliberately generous so a tail is never retained because this cheaper
+// estimate happens to undercount.
+const PART_OVERHEAD_CHARS = 64
+const ATTACHMENT_CHARS = 1_000
+
+function estimateMessages(messages: SessionV1.WithParts[]) {
+  let chars = 0
+  for (const message of messages) {
+    chars += PART_OVERHEAD_CHARS
+    for (const part of message.parts) {
+      if (part.type === "text" || part.type === "reasoning") {
+        chars += part.text.length + PART_OVERHEAD_CHARS
+        continue
+      }
+      if (part.type === "file") {
+        chars += (part.filename?.length ?? 0) + ATTACHMENT_CHARS
+        continue
+      }
+      if (part.type === "tool") {
+        chars += part.tool.length + part.callID.length + PART_OVERHEAD_CHARS
+        if (part.state.status === "completed") {
+          chars += (part.state.time.compacted ? 0 : part.state.output.length) + PART_OVERHEAD_CHARS
+          chars += (part.state.attachments?.length ?? 0) * ATTACHMENT_CHARS
+        }
+        if (part.state.status === "error") chars += part.state.error.length + PART_OVERHEAD_CHARS
+      }
+    }
+  }
+  // Matches Token.estimate's 4-chars-per-token heuristic without needing a
+  // string allocation proportional to the transcript.
+  return Math.ceil(chars / 4)
+}
+
 function preserveRecentBudget(input: { cfg: ConfigV1.Info; model: Provider.Model }) {
   return (
     input.cfg.compaction?.preserve_recent_tokens ??
@@ -140,26 +176,20 @@ function turns(messages: SessionV1.WithParts[]) {
 function splitTurn(input: {
   messages: SessionV1.WithParts[]
   turn: Turn
-  model: Provider.Model
   budget: number
-  estimate: (input: { messages: SessionV1.WithParts[]; model: Provider.Model }) => Effect.Effect<number>
+  estimate: (input: { messages: SessionV1.WithParts[] }) => number
 }) {
-  return Effect.gen(function* () {
-    if (input.budget <= 0) return undefined
-    if (input.turn.end - input.turn.start <= 1) return undefined
-    for (let start = input.turn.start + 1; start < input.turn.end; start++) {
-      const size = yield* input.estimate({
-        messages: input.messages.slice(start, input.turn.end),
-        model: input.model,
-      })
-      if (size > input.budget) continue
-      return {
-        start,
-        id: input.messages[start]!.info.id,
-      } satisfies Tail
-    }
-    return undefined
-  })
+  if (input.budget <= 0) return undefined
+  if (input.turn.end - input.turn.start <= 1) return undefined
+  for (let start = input.turn.start + 1; start < input.turn.end; start++) {
+    const size = input.estimate({ messages: input.messages.slice(start, input.turn.end) })
+    if (size > input.budget) continue
+    return {
+      start,
+      id: input.messages[start]!.info.id,
+    } satisfies Tail
+  }
+  return undefined
 }
 
 export interface Interface {
@@ -199,6 +229,7 @@ const layer = Layer.effect(
     const provider = yield* Provider.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const truncate = yield* Truncate.Service
 
     const isOverflow = Effect.fn("SessionCompaction.isOverflow")(function* (input: {
       tokens: SessionV1.Assistant["tokens"]
@@ -212,13 +243,12 @@ const layer = Layer.effect(
       })
     })
 
-    const estimate = Effect.fn("SessionCompaction.estimate")(function* (input: {
-      messages: SessionV1.WithParts[]
-      model: Provider.Model
-    }) {
-      const msgs = yield* MessageV2.toModelMessagesEffect(input.messages, input.model)
-      return Token.estimate(JSON.stringify(msgs))
-    })
+    // Tail selection only needs a size comparison against a token budget, and it
+    // runs this once per candidate turn. Building model messages and then
+    // JSON.stringify-ing the whole batch allocated a second and third copy of
+    // every retained string at exactly the point where memory is most
+    // constrained, so walk the stored parts and size them directly instead.
+    const estimate = (input: { messages: SessionV1.WithParts[] }) => estimateMessages(input.messages)
 
     const select = Effect.fn("SessionCompaction.select")(function* (input: {
       messages: SessionV1.WithParts[]
@@ -237,20 +267,16 @@ const layer = Layer.effect(
       for (let i = recent.length - 1; i >= 0; i--) {
         const turn = recent[i]!
         // estimate lazily so cost stays proportional to the retained tail, not the whole session
-        const size = yield* estimate({
-          messages: input.messages.slice(turn.start, turn.end),
-          model: input.model,
-        })
+        const size = estimate({ messages: input.messages.slice(turn.start, turn.end) })
         if (total + size <= budget) {
           total += size
           keep = { start: turn.start, id: turn.id }
           continue
         }
         const remaining = budget - total
-        const split = yield* splitTurn({
+        const split = splitTurn({
           messages: input.messages,
           turn,
-          model: input.model,
           budget: remaining,
           estimate,
         })
@@ -309,6 +335,14 @@ const layer = Layer.effect(
         for (const part of toPrune) {
           if (part.state.status === "completed") {
             part.state.time.compacted = Date.now()
+            // Clearing the marker alone leaves the payload in SQLite and in every
+            // future hydration of this transcript, which is where the retained
+            // heap actually goes. Persist the full text to the tool-output
+            // directory once, then keep only a placeholder inline.
+            if (part.state.metadata.outputPath === undefined) {
+              part.state.metadata.outputPath = yield* truncate.write(part.state.output)
+            }
+            part.state.output = MessageV2.COMPACTED_OUTPUT
             yield* session.updatePart(part)
           }
         }
@@ -605,6 +639,7 @@ export const node = LayerNode.make({
     Plugin.node,
     SessionProcessor.node,
     Provider.node,
+    Truncate.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
   ],

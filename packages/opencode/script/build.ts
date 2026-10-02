@@ -190,6 +190,9 @@ for (const item of targets) {
       ...(embeddedFileMap ? ["opencode-web-ui.gen.ts"] : []),
     ],
     define: {
+      ...(process.argv.includes("--coding")
+        ? { "process.env.OPENCODE_CODING_ONLY": JSON.stringify("1") }
+        : {}),
       FFF_LIBC: JSON.stringify(item.abi === "musl" ? "musl" : "gnu"),
       OPENCODE_VERSION: `'${Script.version}'`,
       OPENCODE_MODELS_DEV: JSON.stringify(generated.modelsData),

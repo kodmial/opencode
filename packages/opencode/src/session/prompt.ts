@@ -1089,7 +1089,7 @@ const layer = Layer.effect(
           yield* status.set(sessionID, { type: "busy" })
           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          let msgs = yield* MessageV2.activeEffect(sessionID).pipe(
             Effect.provideService(Database.Service, database),
           )
 

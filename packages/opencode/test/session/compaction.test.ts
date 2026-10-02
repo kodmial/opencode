@@ -710,6 +710,12 @@ describe("session.compaction.prune", () => {
           expect(part?.state.status).toBe("completed")
           if (part?.type === "tool" && part.state.status === "completed") {
             expect(part.state.time.compacted).toBeNumber()
+            // The payload moves to disk instead of staying inline, so a
+            // rehydrated transcript no longer carries it in the heap.
+            expect(part.state.output).toBe(MessageV2.COMPACTED_OUTPUT)
+            const outputPath = part.state.metadata.outputPath
+            expect(outputPath).toBeString()
+            expect(Bun.file(outputPath as string).size).toBe(200_000)
           }
         }),
 

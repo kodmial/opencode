@@ -39,6 +39,14 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
   enableExperimentalModels: bool("OPENCODE_ENABLE_EXPERIMENTAL_MODELS"),
   enableQuestionTool: bool("OPENCODE_ENABLE_QUESTION_TOOL"),
+  // Disk-first memory profile. Defaults on for the stripped headless runner
+  // (the CLI entrypoint marks itself with AGENT=1 and has no TUI to render
+  // large inline previews) and stays off for interactive builds. Set
+  // OPENCODE_LOW_MEMORY=0 to force the interactive limits back on.
+  lowMemory: Config.all({
+    explicit: Config.boolean("OPENCODE_LOW_MEMORY").pipe(Config.option),
+    headless: Config.succeed(process.env.AGENT === "1"),
+  }).pipe(Config.map((flags) => Option.getOrElse(flags.explicit, () => flags.headless))),
   experimentalReferences: enabledByExperimental("OPENCODE_EXPERIMENTAL_REFERENCES"),
   experimentalBackgroundSubagents: enabledByExperimental("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS"),
   experimentalLspTy: bool("OPENCODE_EXPERIMENTAL_LSP_TY"),
