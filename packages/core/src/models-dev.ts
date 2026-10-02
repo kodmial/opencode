@@ -133,7 +133,9 @@ export type Provider = Schema.Schema.Type<typeof Provider>
 
 export const Event = ModelsDev.Event
 
-declare const OPENCODE_MODELS_DEV: Record<string, Provider> | undefined
+// Bundled builds embed the snapshot as a JSON string literal rather than an object
+// literal so that the provider graph is not constructed during module evaluation.
+declare const OPENCODE_MODELS_DEV: string | undefined
 
 export interface Interface {
   readonly get: () => Effect.Effect<Record<string, Provider>>
@@ -196,7 +198,9 @@ const layer = Layer.effect(
     )
 
     const loadSnapshot = Effect.sync(() =>
-      typeof OPENCODE_MODELS_DEV === "undefined" ? undefined : OPENCODE_MODELS_DEV,
+      typeof OPENCODE_MODELS_DEV === "undefined"
+        ? undefined
+        : (JSON.parse(OPENCODE_MODELS_DEV) as Record<string, Provider>),
     )
 
     const fetchAndWrite = Effect.fn("ModelsDev.fetchAndWrite")(function* () {

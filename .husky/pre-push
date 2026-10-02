@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# Workflow-owned automation pushes do not always expose bun on PATH, and the hook
+# is only a local convenience: the agent runs the relevant tests before pushing and
+# pull request CI stays authoritative. Skip instead of failing the push.
+if [ "$CI" = "true" ] || [ "$CI" = "1" ]; then
+  echo "pre-push: skipped (CI automation push)"
+  exit 0
+fi
+
 # Never block a push just because the toolchain is unavailable. Automation
 # pushes from runners that intentionally skip installing Bun, and a hook is not
 # a place to fail a push over a missing dev dependency.

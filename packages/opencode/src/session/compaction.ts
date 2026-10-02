@@ -409,7 +409,12 @@ const layer = Layer.effect(
         { sessionID: input.sessionID },
         { context: [], prompt: undefined },
       )
-      const msgs = structuredClone(selected.head)
+      // Plugins transform the head in place, so it has to be copied away from the caller's
+      // message objects. Skip the copy when nothing implements the transform: on a long
+      // session that clone is one of the largest transient allocations in the process.
+      const hooks = yield* plugin.list()
+      const transformable = hooks.some((hook) => hook["experimental.chat.messages.transform"])
+      const msgs = transformable ? structuredClone(selected.head) : selected.head
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
       const nextPrompt =

@@ -1259,6 +1259,9 @@ export interface Interface {
 interface State {
   models: Map<string, LanguageModelV3>
   providers: Record<ProviderV2.ID, Info>
+  // Provider catalog entries are converted from the models.dev snapshot on first touch
+  // and cached. The snapshot carries thousands of models across every provider, while a
+  // coding run only ever needs the handful it is configured for.
   catalog: (providerID: ProviderV2.ID) => Info | undefined
   catalogIDs: () => string[]
   sdk: Map<string, BundledSDK>
@@ -1483,6 +1486,30 @@ const layer = Layer.effect(
           return published
         }
 
+        // Custom loaders almost never read `models`; handing them a shell keeps the
+        // conversion out of the startup path for providers that are never connected.
+        const shellFor = (providerID: ProviderV2.ID) => {
+          const existing = publicCatalog.get(providerID)
+          if (existing) return existing
+          const source = modelsDev[providerID]
+          if (!source) return undefined
+          return Object.defineProperty(
+            {
+              id: providerID,
+              name: source.name,
+              env: [...(source.env ?? [])],
+              source: "custom",
+              options: {},
+            },
+            "models",
+            {
+              enumerable: true,
+              configurable: true,
+              get: () => database(providerID)?.models ?? {},
+            },
+          ) as Info
+        }
+
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
         const modelLoaders: {
@@ -1657,13 +1684,15 @@ const layer = Layer.effect(
           publicCatalog.set(ProviderV2.ID.make(providerID), parsed)
         }
 
-        // load env - read env names straight off the raw models.dev payload so
-        // credential discovery never forces the whole catalog into the heap
+        // load env - read env names straight off the raw models.dev payload (and
+        // explicit config env overrides) so credential discovery never forces the
+        // whole catalog into the heap
         const envs = yield* env.all()
+        const configEnv = new Map(configProviders.map(([id, provider]) => [id, provider.env]))
         for (const id of new Set([...catalogIDs, ...publicCatalog.keys()])) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const names = modelsDev[id]?.env ?? publicCatalog.get(providerID)?.env ?? []
+          const names = configEnv.get(id) ?? modelsDev[id]?.env ?? publicCatalog.get(providerID)?.env ?? []
           const apiKey = names.map((item) => envs[item]).find(Boolean)
           if (!apiKey) continue
           mergeProvider(providerID, {
@@ -1711,7 +1740,7 @@ const layer = Layer.effect(
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
           if (disabled.has(providerID)) continue
-          const data = database(providerID)
+          const data = shellFor(providerID)
           if (!data) {
             continue
           }

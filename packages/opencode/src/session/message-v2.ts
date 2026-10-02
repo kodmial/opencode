@@ -22,6 +22,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { NotFoundError } from "@/storage/storage"
 import { and } from "drizzle-orm"
+import { asc } from "drizzle-orm"
 import { desc } from "drizzle-orm"
 import { eq } from "drizzle-orm"
 import { inArray } from "drizzle-orm"
@@ -519,6 +520,94 @@ export function stream(sessionID: SessionID) {
   })
 }
 
+// Only the message fields filterCompacted's boundary logic reads. Selecting whole
+// message rows is cheap; selecting every part in the session is not.
+const scan = (data: unknown) =>
+  data as { role?: string; summary?: boolean; finish?: string; error?: unknown; parentID?: string }
+
+/**
+ * Resolves the same array `filterCompacted` produces without streaming every part of
+ * every historical message. The compaction boundary is derived from message rows plus
+ * the handful of compaction parts that can produce one, then only the summary, the
+ * retained tail, and the post-compaction messages are hydrated.
+ *
+ * Returns undefined when the boundary is not unambiguous, in which case callers must
+ * fall back to `filterCompacted(stream(sessionID))` so behavior stays identical.
+ */
+const activeWindow = Effect.fnUntraced(function* (db: Database.Interface["db"], sessionID: SessionID) {
+  const rows = yield* db
+    .select()
+    .from(MessageTable)
+    .where(eq(MessageTable.session_id, sessionID))
+    .orderBy(asc(MessageTable.time_created), asc(MessageTable.id))
+    .all()
+    .pipe(Effect.orDie)
+  if (rows.length === 0) return undefined
+
+  // A compaction part is only ever attached to a user message that owns a summary
+  // assistant, and `tail_start_id` is only written once that summary has been produced.
+  // So the parents of summary assistants are the complete set of possible boundaries.
+  const summarized = new Set<string>()
+  const completed = new Set<string>()
+  for (const row of rows) {
+    const data = scan(row.data)
+    if (!data.summary) continue
+    if (!data.parentID) continue
+    summarized.add(data.parentID)
+    if (data.finish && !data.error) completed.add(data.parentID)
+  }
+  if (summarized.size === 0) return undefined
+
+  const candidates = rows.flatMap((row, index) => (summarized.has(row.id) && scan(row.data).role === "user" ? [index] : []))
+  if (candidates.length === 0) return undefined
+
+  const partRows = yield* db
+    .select()
+    .from(PartTable)
+    .where(inArray(PartTable.message_id, candidates.map((index) => rows[index]!.id)))
+    .orderBy(PartTable.message_id, PartTable.id)
+    .all()
+    .pipe(Effect.orDie)
+
+  const tails = new Map<MessageID, MessageID | undefined>()
+  for (const row of partRows) {
+    const data = row.data as { type?: string; tail_start_id?: MessageID }
+    if (data.type !== "compaction") continue
+    // `find` in filterCompacted resolves a single compaction part; duplicates would
+    // make the two code paths disagree, so defer to the full stream instead.
+    if (tails.has(row.message_id)) return undefined
+    tails.set(row.message_id, data.tail_start_id)
+  }
+
+  // `compactionIndex` is the newest message carrying a compaction part with a tail.
+  const boundary = candidates.findLast((index) => tails.get(rows[index]!.id) !== undefined)
+  if (boundary === undefined) return undefined
+  const tail = tails.get(rows[boundary]!.id)
+  if (tail === undefined) return undefined
+
+  // A finished compaction without a retained tail stops filterCompacted's scan early
+  // and yields a differently shaped result, so that shape has to stay on the slow path.
+  if (candidates.some((index) => index > boundary && completed.has(rows[index]!.id) && tails.has(rows[index]!.id)))
+    return undefined
+
+  const tailIndex = rows.findIndex((row) => row.id === tail)
+  if (tailIndex < 0 || tailIndex >= boundary) return undefined
+
+  const compactionID = rows[boundary]!.id
+  const summaryIndex = rows.findIndex((row, index) => {
+    if (index <= boundary) return false
+    const data = scan(row.data)
+    return data.role === "assistant" && !!data.summary && data.parentID === compactionID
+  })
+  if (summaryIndex <= boundary) return undefined
+
+  return [
+    ...rows.slice(boundary, summaryIndex + 1),
+    ...rows.slice(tailIndex, boundary),
+    ...rows.slice(summaryIndex + 1),
+  ]
+})
+
 // Same newest-first ordering as stream(), but stops paging at the compaction
 // boundary instead of materializing the whole session. Rows older than the
 // boundary stay on disk rather than entering the JS heap only to be discarded.
@@ -619,6 +708,11 @@ export function filterCompacted(msgs: Iterable<WithParts>) {
 }
 
 export const filterCompactedEffect = Effect.fnUntraced(function* (sessionID: SessionID) {
+  const { db } = yield* Database.Service
+  // `SessionPrompt.runLoop` asks for the active context on every iteration, so the
+  // discarded pre-compaction range must never be hydrated just to be filtered out.
+  const window = yield* activeWindow(db, sessionID)
+  if (window) return yield* hydrate(db, window)
   return filterCompacted(yield* stream(sessionID))
 })
 
