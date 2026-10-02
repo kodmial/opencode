@@ -632,11 +632,34 @@ const layer: Layer.Layer<
         return msg
       }).pipe(Effect.withSpan("Session.updateMessage"))
 
+    // Headless coding runs have no UI consuming large display payloads, and every
+    // updatePart publishes a structuredClone for event subscribers. Cloning a
+    // full file body (metadata.display.text duplicates the already-stored
+    // output) on every streaming update is a hot-path heap amplifier, so in
+    // low-memory mode publish a redacted preview. The persisted part returned to
+    // the caller is untouched; only the event copy is bounded.
+    const redactPartForEvent = <T extends SessionV1.Part>(part: T): T => {
+      if (!flags.lowMemory) return structuredClone(part)
+      if (part.type !== "tool") return structuredClone(part)
+      const cloned = structuredClone(part)
+      const metadata = (cloned as SessionV1.ToolPart).state?.metadata as Record<string, any> | undefined
+      const display = metadata?.display as { text?: unknown } | undefined
+      if (display && typeof display.text === "string" && display.text.length > 2000) {
+        display.text = `${display.text.slice(0, 2000)}\n[display text redacted for low-memory event: full output on disk]`
+      }
+      if (cloned.type === "tool" && cloned.state.status === "completed" && cloned.state.output.length > 2000) {
+        const outputPath = (cloned.state.metadata as Record<string, any> | undefined)?.outputPath
+        cloned.state.output =
+          `${cloned.state.output.slice(0, 2000)}\n[tool output redacted for low-memory event${typeof outputPath === "string" ? `: full content at ${outputPath}` : ""}]`
+      }
+      return cloned as T
+    }
+
     const updatePart = <T extends SessionV1.Part>(part: T): Effect.Effect<T> =>
       Effect.gen(function* () {
         yield* events.publish(SessionV1.Event.PartUpdated, {
           sessionID: part.sessionID,
-          part: structuredClone(part),
+          part: redactPartForEvent(part),
           time: Date.now(),
         })
         return part
