@@ -1457,6 +1457,16 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
         const cfg = yield* config.get()
         const modelsDev = yield* modelsDevSvc.get()
+        // now read config providers - includes any modifications from plugin config() hook
+        const configProviders = Object.entries(cfg.provider ?? {})
+        const disabled = new Set(cfg.disabled_providers ?? [])
+        const enabled = cfg.enabled_providers ? new Set(cfg.enabled_providers) : null
+
+        function isProviderAllowed(providerID: ProviderV2.ID): boolean {
+          if (enabled && !enabled.has(providerID)) return false
+          if (disabled.has(providerID)) return false
+          return true
+        }
         // models.dev carries thousands of models for every provider it knows.
         // Building the whole catalog up front - and then again through
         // toPublicInfo - dominated startup RSS for a worker that only ever
@@ -1464,10 +1474,13 @@ const layer = Layer.effect(
         // memoized from there. The raw and public views stay separate because
         // the initialization below mutates the public one (blacklists, alpha and
         // deprecated removals) and must not corrupt suggestion lookups.
+        // enabled_providers is applied before conversion so a coding worker
+        // with a small provider set never materializes the rest of the catalog.
         const rawCatalog = new Map<ProviderV2.ID, Info>()
         const publicCatalog = new Map<ProviderV2.ID, Info>()
         const catalogIDs = Object.keys(modelsDev)
         const catalog = (providerID: ProviderV2.ID) => {
+          if (!isProviderAllowed(providerID)) return undefined
           const cached = rawCatalog.get(providerID)
           if (cached) return cached
           const raw = modelsDev[providerID]
@@ -1489,6 +1502,7 @@ const layer = Layer.effect(
         // Custom loaders almost never read `models`; handing them a shell keeps the
         // conversion out of the startup path for providers that are never connected.
         const shellFor = (providerID: ProviderV2.ID) => {
+          if (!isProviderAllowed(providerID)) return undefined
           const existing = publicCatalog.get(providerID)
           if (existing) return existing
           const source = modelsDev[providerID]
@@ -1545,24 +1559,13 @@ const layer = Layer.effect(
         // load plugins first so config() hook runs before reading cfg.provider
         const plugins = yield* plugin.list()
 
-        // now read config providers - includes any modifications from plugin config() hook
-        const configProviders = Object.entries(cfg.provider ?? {})
-        const disabled = new Set(cfg.disabled_providers ?? [])
-        const enabled = cfg.enabled_providers ? new Set(cfg.enabled_providers) : null
-
-        function isProviderAllowed(providerID: ProviderV2.ID): boolean {
-          if (enabled && !enabled.has(providerID)) return false
-          if (disabled.has(providerID)) return false
-          return true
-        }
-
         for (const hook of plugins) {
           const p = hook.provider
           const models = p?.models
           if (!p || !models) continue
 
           const providerID = ProviderV2.ID.make(p.id)
-          if (disabled.has(providerID)) continue
+          if (!isProviderAllowed(providerID)) continue
 
           const provider = database(providerID)
           if (!provider) continue
@@ -1691,7 +1694,7 @@ const layer = Layer.effect(
         const configEnv = new Map(configProviders.map(([id, provider]) => [id, provider.env]))
         for (const id of new Set([...catalogIDs, ...publicCatalog.keys()])) {
           const providerID = ProviderV2.ID.make(id)
-          if (disabled.has(providerID)) continue
+          if (!isProviderAllowed(providerID)) continue
           const names = configEnv.get(id) ?? modelsDev[id]?.env ?? publicCatalog.get(providerID)?.env ?? []
           const apiKey = names.map((item) => envs[item]).find(Boolean)
           if (!apiKey) continue
@@ -1705,7 +1708,7 @@ const layer = Layer.effect(
         const auths = yield* auth.all().pipe(Effect.orDie)
         for (const [id, provider] of Object.entries(auths)) {
           const providerID = ProviderV2.ID.make(id)
-          if (disabled.has(providerID)) continue
+          if (!isProviderAllowed(providerID)) continue
           if (provider.type === "api") {
             mergeProvider(providerID, {
               source: "api",
@@ -1718,7 +1721,7 @@ const layer = Layer.effect(
         for (const plugin of plugins) {
           if (!plugin.auth) continue
           const providerID = ProviderV2.ID.make(plugin.auth.provider)
-          if (disabled.has(providerID)) continue
+          if (!isProviderAllowed(providerID)) continue
 
           const stored = yield* auth.get(providerID).pipe(Effect.orDie)
           if (!stored) continue
@@ -1739,7 +1742,7 @@ const layer = Layer.effect(
 
         for (const [id, fn] of Object.entries(custom(dep))) {
           const providerID = ProviderV2.ID.make(id)
-          if (disabled.has(providerID)) continue
+          if (!isProviderAllowed(providerID)) continue
           const data = shellFor(providerID)
           if (!data) {
             continue
@@ -1833,7 +1836,7 @@ const layer = Layer.effect(
           models: languages,
           providers,
           catalog,
-          catalogIDs: () => catalogIDs,
+          catalogIDs: () => (enabled ? catalogIDs.filter((id) => isProviderAllowed(ProviderV2.ID.make(id))) : catalogIDs),
           sdk,
           modelLoaders,
           varsLoaders,

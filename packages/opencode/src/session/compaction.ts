@@ -298,7 +298,10 @@ const layer = Layer.effect(
     // calls, then erases output of older tool calls to free context space
     const prune = Effect.fn("SessionCompaction.prune")(function* (input: { sessionID: SessionID }) {
       const cfg = yield* config.get()
-      if (!cfg.compaction?.prune) return
+      // Disk-first coding runs keep every large tool result under Global.Path.data
+      // via Truncate and must not accumulate unbounded inline payloads in SQLite
+      // and the JS heap merely because the interactive prune flag is unset.
+      if (!cfg.compaction?.prune && !flags.lowMemory) return
       yield* Effect.logInfo("pruning")
 
       const msgs = yield* session
