@@ -20,5 +20,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-issue-scheduler.yml/enable"
-          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/continuum-auto-merge.yml/enable"
+          for workflow in continuum-issue-scheduler.yml continuum-auto-merge.yml; do
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/enable"
+            state="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow" --jq .state)"
+            echo "$workflow state=$state"
+            [[ "$state" == "active" ]] || {
+              echo "::error::$workflow did not become active"
+              exit 1
+            }
+          done
