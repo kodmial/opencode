@@ -1,0 +1,165 @@
+name: OpenCode anonymous Zen E2E
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue containing anonymous-Zen E2E metadata"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    outputs:
+      local_e2e: ${{ steps.route.outputs.local_e2e }}
+      model: ${{ steps.route.outputs.model }}
+      source_run: ${{ steps.route.outputs.source_run }}
+      artifact_id: ${{ steps.route.outputs.artifact_id }}
+      source_sha: ${{ steps.route.outputs.source_sha }}
+    steps:
+      - name: Detect local anonymous Zen validation
+        id: route
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: issue
+          ISSUE_NUMBER: ${{ inputs.issue_number }}
+        run: |
+          set -euo pipefail
+          echo "local_e2e=false" >> "$GITHUB_OUTPUT"
+          [[ "$MODE" == "issue" ]] || exit 0
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ ]] || exit 0
+
+          BODY="$(gh issue view "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""')"
+          grep -Fq '<!-- execution:anonymous-zen-e2e -->' <<<"$BODY" || exit 0
+
+          MODEL="$(sed -n 's/^- model ID: `\([^`]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+          SOURCE_RUN="$(sed -n 's/^- source workflow run: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+          ARTIFACT_ID="$(sed -n 's/^- artifact ID: `\([0-9]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+          SOURCE_SHA="$(sed -n 's/^- source SHA: `\([0-9a-f]*\)`.*/\1/p' <<<"$BODY" | head -1)"
+
+          [[ -n "$MODEL" && -n "$SOURCE_RUN" && -n "$ARTIFACT_ID" && -n "$SOURCE_SHA" ]] || {
+            echo "::error::anonymous Zen E2E marker is present but required metadata could not be parsed from the issue body"
+            exit 1
+          }
+
+          echo "local_e2e=true" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+          echo "source_run=$SOURCE_RUN" >> "$GITHUB_OUTPUT"
+          echo "artifact_id=$ARTIFACT_ID" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+
+  anonymous-zen-e2e:
+    needs: route
+    if: needs.route.outputs.local_e2e == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    concurrency:
+      group: opencode-anonymous-zen-e2e-${{ inputs.issue_number }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+      MODEL: ${{ needs.route.outputs.model }}
+      SOURCE_SHA: ${{ needs.route.outputs.source_sha }}
+      SOURCE_RUN: ${{ needs.route.outputs.source_run }}
+      ARTIFACT_ID: ${{ needs.route.outputs.artifact_id }}
+    steps:
+      - name: Checkout validation harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 1
+          ref: main
+
+      - name: Download exact PR artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.route.outputs.source_run }}
+          artifact-ids: ${{ needs.route.outputs.artifact_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/pr12-artifact
+
+      - name: Run anonymous Zen E2E
+        id: e2e
+        shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/pr12-artifact
+        run: bash .github/scripts/run-anonymous-zen-e2e.sh
+
+      - name: Upload structured E2E result
+        id: result_artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-pr12-zen-muse13-e2e
+          path: ${{ runner.temp }}/opencode-anonymous-zen-e2e/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish result to issue
+        if: always()
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ steps.result_artifact.outputs.artifact-url }}
+          RESULT_ARTIFACT_ID: ${{ steps.result_artifact.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          JSON="$RUNNER_TEMP/opencode-anonymous-zen-e2e/result.json"
+          if [[ ! -f "$JSON" ]]; then
+            mkdir -p "$(dirname "$JSON")"
+            jq -n \
+              --arg RESULT "FAIL" \
+              --arg ARTIFACT_ID "$ARTIFACT_ID" \
+              --arg SOURCE_SHA "$SOURCE_SHA" \
+              --arg MODEL "$MODEL" \
+              --arg ACTIONS_RUN "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              '{RESULT:$RESULT,ARTIFACT_ID:$ARTIFACT_ID,SOURCE_SHA:$SOURCE_SHA,BINARY_SHA256:"",MODEL:$MODEL,AUTH_MODE:"anonymous/no API key",MINIMAL_REQUEST:"fail",MINIMAL_EXIT_CODE:"not-run",MINIMAL_RESPONSE:"validation harness failed before producing result.json",CODING_LOOP:"fail",TOOLS_OBSERVED:"none",FILE_EDIT_CONFIRMED:"no",TEST_COMMAND:"python3 test_calc.py",TEST_EXIT_CODE:"not-run",RUNTIME_INVARIANTS:"fail",ACTIONS_RUN:$ACTIONS_RUN,NOTES:"validation harness failure"}' > "$JSON"
+          fi
+
+          value() { jq -r --arg k "$1" '.[$k] // ""' "$JSON"; }
+          RESULT="$(value RESULT)"
+          BODY="$RUNNER_TEMP/e2e-comment.md"
+          cat > "$BODY" <<EOF
+          RESULT: $RESULT
+          ARTIFACT_ID: $(value ARTIFACT_ID)
+          SOURCE_SHA: $(value SOURCE_SHA)
+          BINARY_SHA256: $(value BINARY_SHA256)
+          MODEL: $(value MODEL)
+          AUTH_MODE: $(value AUTH_MODE)
+          MINIMAL_REQUEST: $(value MINIMAL_REQUEST)
+          MINIMAL_EXIT_CODE: $(value MINIMAL_EXIT_CODE)
+          MINIMAL_RESPONSE: $(value MINIMAL_RESPONSE)
+          CODING_LOOP: $(value CODING_LOOP)
+          TOOLS_OBSERVED: $(value TOOLS_OBSERVED)
+          FILE_EDIT_CONFIRMED: $(value FILE_EDIT_CONFIRMED)
+          TEST_COMMAND: $(value TEST_COMMAND)
+          TEST_EXIT_CODE: $(value TEST_EXIT_CODE)
+          RUNTIME_INVARIANTS: $(value RUNTIME_INVARIANTS)
+          ACTIONS_RUN: $(value ACTIONS_RUN)
+          RESULT_ARTIFACT: opencode-pr12-zen-muse13-e2e — ${ARTIFACT_URL:-artifact-id:${RESULT_ARTIFACT_ID:-unknown}}
+          NOTES: $(value NOTES)
+          EOF
+          gh issue comment "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$BODY"
+          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/labels/automation:in-progress" >/dev/null 2>&1 || true
+          if [[ "$RESULT" == "PASS" ]]; then
+            gh issue close "$ISSUE_NUMBER" --repo "$GITHUB_REPOSITORY" --reason completed
+          fi
+
+      - name: Fail workflow on failed validation
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          JSON="$RUNNER_TEMP/opencode-anonymous-zen-e2e/result.json"
+          [[ -f "$JSON" ]] || exit 1
+          [[ "$(jq -r '.RESULT' "$JSON")" == "PASS" ]]
