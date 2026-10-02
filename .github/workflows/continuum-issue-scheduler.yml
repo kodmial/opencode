@@ -83,7 +83,7 @@ on:
         required: false
         type: string
   schedule:
-    - cron: "58,3,8,13,18,23,28,33,38,43,48,53 * * * *"
+    - cron: "*/15 * * * *"
   issues:
     types: [opened, reopened, closed, labeled, unlabeled]
   issue_comment:
