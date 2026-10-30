@@ -11,10 +11,12 @@ on:
     branches: [main]
     paths:
       - "packages/opencode/**"
+      - ".github/scripts/run-anonymous-zen-e2e.sh"
   push:
     branches: [main]
     paths:
       - "packages/opencode/**"
+      - ".github/scripts/run-anonymous-zen-e2e.sh"
       - ".github/workflows/release-coding-smoke.yml"
 
 permissions:
