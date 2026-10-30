@@ -205,9 +205,9 @@ PY
 
   tools_observed="$({
     grep -Eo '"tool"[[:space:]]*:[[:space:]]*"[^"]+"' "$OUT/coding.stdout" 2>/dev/null \
-      | sed -E 's/.*"tool"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/'
+      | sed -E 's/.*"tool"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' || true
     grep -Eo '"name"[[:space:]]*:[[:space:]]*"(read|write|edit|apply_patch|bash|shell|grep|glob)"' "$OUT/coding.stdout" 2>/dev/null \
-      | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/'
+      | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/' || true
   } | sort -u | paste -sd, -)"
   [[ -n "$tools_observed" ]] || tools_observed="not-extracted"
 
