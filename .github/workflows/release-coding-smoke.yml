@@ -124,7 +124,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       SOURCE_SHA: ${{ inputs.source_sha || github.event.pull_request.head.sha || github.sha }}
       SOURCE_KIND: release
-      MODEL: opencode/muse-spark-1.3-contributor-free
+      # Coding smoke uses a currently listed Zen chat-completions model;
+      # operators may override it without changing the AA chatbot or PR-Agent policy.
+      MODEL: ${{ vars.OPENCODE_CODING_MODEL || 'opencode/deepseek-v4.1-flash-free' }}
       VERSION: "1.18.33"
       ISSUE_NUMBER: "14"
     steps:
@@ -200,13 +202,13 @@ jobs:
           $marker
           Immutable coding release validation: **$RESULT**
 
-          - source SHA: `$SOURCE_SHA`
-          - release tag: `${RELEASE_TAG:-unknown}`
-          - release asset ID: `${ARTIFACT_ID:-unknown}`
-          - binary SHA-256: `$(jq -r '.BINARY_SHA256 // ""' "$JSON")`
-          - minimal request: `$(jq -r '.MINIMAL_REQUEST // ""' "$JSON")`
-          - coding loop: `$(jq -r '.CODING_LOOP // ""' "$JSON")`
-          - runtime invariants: `$(jq -r '.RUNTIME_INVARIANTS // ""' "$JSON")`
+          - source SHA: \`$SOURCE_SHA\`
+          - release tag: \`${RELEASE_TAG:-unknown}\`
+          - release asset ID: \`${ARTIFACT_ID:-unknown}\`
+          - binary SHA-256: \`$(jq -r '.BINARY_SHA256 // ""' "$JSON")\`
+          - minimal request: \`$(jq -r '.MINIMAL_REQUEST // ""' "$JSON")\`
+          - coding loop: \`$(jq -r '.CODING_LOOP // ""' "$JSON")\`
+          - runtime invariants: \`$(jq -r '.RUNTIME_INVARIANTS // ""' "$JSON")\`
           - workflow: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
           - detailed result artifact: ${RESULT_ARTIFACT_URL:-not available}
 
