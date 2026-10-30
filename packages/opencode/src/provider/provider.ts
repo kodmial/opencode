@@ -1479,6 +1479,21 @@ const layer = Layer.effect(
         const rawCatalog = new Map<ProviderV2.ID, Info>()
         const publicCatalog = new Map<ProviderV2.ID, Info>()
         const catalogIDs = Object.keys(modelsDev)
+        // The models.dev snapshot carries thousands of models; catalog() already
+        // converts lazily, but the raw snapshot object stays reachable through
+        // this closure for the life of the process. In the coding build the
+        // worker only ever touches its configured provider set, so release raw
+        // entries that catalog() can never return. This only mutates the shared
+        // ModelsDev cache inside the coding build where no other consumer needs
+        // the pruned providers; interactive processes keep the full snapshot.
+        // catalogIDs (plain ID strings) is captured before pruning so suggestion
+        // lookups still know every known provider without retaining its models.
+        const codingBuild = process.env.OPENCODE_CODING_ONLY === "1"
+        if (codingBuild && enabled) {
+          for (const id of catalogIDs) {
+            if (!isProviderAllowed(ProviderV2.ID.make(id))) delete (modelsDev as Record<string, unknown>)[id]
+          }
+        }
         const catalog = (providerID: ProviderV2.ID) => {
           if (!isProviderAllowed(providerID)) return undefined
           const cached = rawCatalog.get(providerID)
@@ -1829,6 +1844,22 @@ const layer = Layer.effect(
           if (Object.keys(provider.models).length === 0) {
             delete providers[providerID]
             continue
+          }
+        }
+
+        // Retained-graph partition for coding workers: after env/auth/config
+        // discovery the connected set is final for this process. Raw snapshot
+        // entries that were never converted hold thousands of untouched model
+        // objects; dropping them leaves only the providers/models actually
+        // touched by the run in the heap. Later catalog() lookups for a pruned
+        // provider return undefined and getModel falls back to fuzzy ID
+        // suggestions, which is acceptable for a single-model coding worker.
+        if (codingBuild && runtimeFlags.lowMemory) {
+          for (const id of catalogIDs) {
+            const pid = ProviderV2.ID.make(id)
+            if (rawCatalog.has(pid) || publicCatalog.has(pid)) continue
+            if (providers[pid]) continue
+            delete (modelsDev as Record<string, unknown>)[id]
           }
         }
 
