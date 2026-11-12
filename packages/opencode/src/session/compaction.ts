@@ -75,9 +75,18 @@ const serialize = (message: SessionV1.WithParts) => {
         const attachments = (part.state.attachments ?? []).map(
           (item) => `[Attached ${item.mime}: ${item.filename ?? "file"}]`,
         )
+        // Clip before joining: [output, ...attachments].join() would transiently
+        // materialize the entire stored tool result even though only the first
+        // TOOL_OUTPUT_MAX_CHARS ever reach the summary. Old/transient large
+        // outputs are exactly what disk-first pruning is trying to keep out of
+        // the heap at compaction time.
+        const preview =
+          part.state.output.length > TOOL_OUTPUT_MAX_CHARS
+            ? part.state.output.slice(0, TOOL_OUTPUT_MAX_CHARS)
+            : part.state.output
         const output = part.state.time.compacted
           ? MessageV2.COMPACTED_OUTPUT
-          : clipToolOutput([part.state.output, ...attachments].join("\n"))
+          : clipToolOutput([preview, ...attachments].join("\n"))
         return [call, `[Tool result]: ${output}`]
       }
       if (part.state.status === "error") return [call, `[Tool error]: ${part.state.error}`]
